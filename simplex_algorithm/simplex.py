@@ -12,144 +12,203 @@ def initialize_tableau(c, A, b):
         b: List of RHS values for constraints.
 
     Returns:
-        A list of lists of Fractions representing the initial tableau.
-        Number of decision variables.
-        Number of slack variables.
+        sparse_tableau: A dictionary where keys are (row_idx, col_idx) tuples and
+                        values are Fraction objects representing non-zero elements.
+        num_decision_vars: Number of original decision variables.
+        num_constraints: Number of constraints (also number of slack variables).
+        num_tableau_rows: Total rows in the conceptual tableau.
+        num_tableau_cols: Total columns in the conceptual tableau.
     """
     num_decision_vars = len(c)
     num_constraints = len(A)
 
     if num_constraints != len(b):
         raise ValueError("Number of constraints in A must match number of RHS values in b.")
-    for row in A:
-        if len(row) != num_decision_vars:
-            raise ValueError("Each constraint row in A must have num_decision_vars elements.")
+    for constraint_row_idx, row_coeffs in enumerate(A):
+        if len(row_coeffs) != num_decision_vars:
+            raise ValueError(f"Constraint row {constraint_row_idx} in A must have num_decision_vars ({num_decision_vars}) elements.")
 
-    # Tableau dimensions: (num_constraints + 1) rows, (num_decision_vars + num_constraints + 1 + 1) cols
-    # +1 for objective row, +1 for objective var (P), +1 for RHS
-    tableau = []
+    num_tableau_rows = num_constraints + 1
+    # Columns: decision_vars + slack_vars + P_var + RHS_value
+    num_tableau_cols = num_decision_vars + num_constraints + 1 + 1
+
+    sparse_tableau = {}
 
     # Constraint rows
     for i in range(num_constraints):
-        row = []
         # Decision variable coefficients
-        for x_coeff in A[i]:
-            row.append(Fraction(x_coeff))
+        for j, x_coeff in enumerate(A[i]):
+            if x_coeff != 0: # Only store non-zero values
+                sparse_tableau[(i, j)] = Fraction(x_coeff)
         # Slack variable coefficients
-        for s_idx in range(num_constraints):
-            row.append(Fraction(1) if s_idx == i else Fraction(0))
-        row.append(Fraction(0)) # Coefficient for P (objective variable)
-        row.append(Fraction(b[i])) # RHS
-        tableau.append(row)
+        # s_i coefficient is 1 for constraint row i, 0 otherwise
+        sparse_tableau[(i, num_decision_vars + i)] = Fraction(1) # This is always 1, so store it
+        # Coefficient for P (objective variable) is 0 in constraint rows, so don't store
+        # RHS
+        if b[i] != 0: # Only store non-zero values
+            sparse_tableau[(i, num_tableau_cols - 1)] = Fraction(b[i])
 
-    # Objective function row
-    obj_row = []
-    for c_coeff in c:
-        obj_row.append(Fraction(-c_coeff)) # Negate for maximization problem (Z - cX = 0)
-    for _ in range(num_constraints): # Slack variable coefficients in objective function
-        obj_row.append(Fraction(0))
-    obj_row.append(Fraction(1)) # Coefficient for P
-    obj_row.append(Fraction(0)) # RHS for objective function
-    tableau.append(obj_row)
+    # Objective function row (last row)
+    obj_row_idx = num_constraints
+    # Decision variable coefficients (negated)
+    for j, c_coeff in enumerate(c):
+        if c_coeff != 0: # Only store non-zero values
+            sparse_tableau[(obj_row_idx, j)] = Fraction(-c_coeff)
+    # Slack variable coefficients in objective function are 0, so don't store
+    # Coefficient for P is 1
+    sparse_tableau[(obj_row_idx, num_decision_vars + num_constraints)] = Fraction(1) # This is always 1
+    # RHS for objective function is 0, so don't store
 
-    return tableau, num_decision_vars, num_constraints
+    return sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols
 
 class SimplexSolver:
-    def __init__(self, tableau, num_decision_vars, num_slack_vars):
+    def __init__(self, sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols):
         """
-        Initializes the SimplexSolver with a tableau and variable counts.
-        The tableau should be a list of lists of Fraction objects.
+        Initializes the SimplexSolver with a sparse tableau and problem dimensions.
+        sparse_tableau: Dictionary {(row, col): Fraction_value}
         num_decision_vars: Number of original decision variables.
-        num_slack_vars: Number of slack (or surplus/artificial) variables.
+        num_constraints: Number of constraints (used as num_slack_vars).
+        num_tableau_rows: Total conceptual rows in the tableau.
+        num_tableau_cols: Total conceptual columns in the tableau.
         """
-        self.tableau = tableau
-        self.rows = len(tableau)
-        self.cols = len(tableau[0]) if self.rows > 0 else 0
+        self.tableau = sparse_tableau # This is now a dictionary
+        self.rows = num_tableau_rows
+        self.cols = num_tableau_cols
         self.num_decision_vars = num_decision_vars
-        self.num_slack_vars = num_slack_vars # num_constraints basically for Ax <= b
+        # num_constraints is the number of slack variables for Ax <= b form
+        self.num_slack_vars = num_constraints
         self.iteration = 0
+
+    def _get_tableau_value(self, row, col):
+        """Helper to get value from sparse tableau, defaults to Fraction(0)."""
+        return self.tableau.get((row, col), Fraction(0))
+
+    def _set_tableau_value(self, row, col, value):
+        """Helper to set value in sparse tableau. Removes entry if value is zero."""
+        if value == Fraction(0):
+            # Remove the key if it exists and value is zero
+            self.tableau.pop((row, col), None)
+        else:
+            self.tableau[(row, col)] = value
 
     def _find_pivot_column(self):
         """Finds the pivot column (entering variable).
         Selects the column with the most negative coefficient in the objective function row.
         Returns the column index or -1 if no negative coefficient is found (optimal).
         """
-        objective_row = self.tableau[-1]
+        objective_row_idx = self.rows - 1
         min_val = Fraction(0)
         pivot_col = -1
         # Only consider decision and slack variables for entering, not P or RHS
         for j in range(self.num_decision_vars + self.num_slack_vars):
-            if objective_row[j] < min_val:
-                min_val = objective_row[j]
+            val = self._get_tableau_value(objective_row_idx, j)
+            if val < min_val:
+                min_val = val
                 pivot_col = j
         return pivot_col
 
     def _find_pivot_row(self, pivot_col):
         """Finds the pivot row (leaving variable) using the minimum ratio test.
-        Returns the row index or -1 if unbounded.
+        Returns the row index or -1 if unbounded or other issue.
         """
         min_ratio = float('inf')
         pivot_row = -1
+        rhs_col_idx = self.cols - 1
+
         for i in range(self.rows - 1): # Exclude objective function row
-            if self.tableau[i][pivot_col] > Fraction(0): # Consider only positive elements in pivot column
-                # Ensure RHS is non-negative for standard ratio test application
-                # This check should ideally be part of problem setup (e.g. handling negative RHS)
-                # For now, assume positive RHS for simplicity in this step.
-                if self.tableau[i][self.cols - 1] < Fraction(0) and self.tableau[i][pivot_col] > Fraction(0):
-                    # This case can lead to issues or requires dual simplex step.
-                    # For now, we will proceed, but this indicates a potential issue if min_ratio remains inf.
-                    # Or, if all tableau[i][pivot_col] <= 0 for rows with positive RHS, it's unbounded.
-                    pass # Allow negative RHS for now, ratio will be negative.
+            pivot_col_val = self._get_tableau_value(i, pivot_col)
 
-                ratio = self.tableau[i][self.cols - 1] / self.tableau[i][pivot_col]
+            if pivot_col_val > Fraction(0): # Consider only positive elements in pivot column
+                rhs_val = self._get_tableau_value(i, rhs_col_idx)
 
-                # Standard ratio test seeks the smallest non-negative ratio.
-                # If all ratios are negative, the problem might be unbounded (if pivot_col coeff > 0).
-                if ratio >= 0 and ratio < min_ratio: # Smallest non-negative ratio
+                # Standard simplex assumes non-negative RHS for ratio test.
+                # If rhs_val is negative, this row should not be chosen by standard ratio test.
+                # (or indicates need for dual simplex or problem re-formulation)
+                if rhs_val < Fraction(0):
+                    continue # Skip rows with negative RHS for this simple implementation
+
+                # Ratio test: RHS / pivot_col_val
+                # If rhs_val is 0 and pivot_col_val > 0, ratio is 0. This is a valid and often preferred pivot.
+                ratio = rhs_val / pivot_col_val
+
+                if ratio < min_ratio:
                     min_ratio = ratio
                     pivot_row = i
-                elif min_ratio == float('inf') and ratio < 0 :
-                    # If all valid ratios are negative, still pick the 'least negative' (closest to 0)
-                    # This part of ratio test can be tricky. Standard is smallest *non-negative*.
-                    # If all self.tableau[i][pivot_col] for positive RHS are <= 0, it's unbounded.
-                    # Let's stick to standard: smallest non-negative. If none, then it implies unboundedness.
-                    pass
+                # Note: Degeneracy (multiple rows with same min_ratio) is not specially handled here.
+                # Bland's rule could be implemented to prevent cycling in degenerate cases.
 
-        # If min_ratio is still infinity, it means no positive divisor was found in pivot column for rows
-        # with positive RHS, indicating unboundedness.
-        if min_ratio == float('inf'):
-            return -1 # Indicates unbounded or other issue.
+        return pivot_row # Will be -1 if no suitable row (e.g. all pivot_col_val <= 0 or all valid RHS < 0)
 
-        return pivot_row
 
     def _pivot(self, pivot_row, pivot_col):
-        """Performs the pivot operation on the tableau."""
-        pivot_element = self.tableau[pivot_row][pivot_col]
+        """Performs the pivot operation on the sparse tableau."""
+        pivot_element = self._get_tableau_value(pivot_row, pivot_col)
         if pivot_element == Fraction(0):
-            # This should not happen if pivot_row and pivot_col are chosen correctly
+            # This should ideally be prevented by _find_pivot_row and _find_pivot_column logic
             raise ValueError("Pivot element cannot be zero.")
 
         # Normalize the pivot row
+        # Iterate over all columns conceptually.
+        # For sparse, we need to update existing non-zero elements and potentially create new ones.
         for j in range(self.cols):
-            self.tableau[pivot_row][j] /= pivot_element
+            val_pivot_row_j = self._get_tableau_value(pivot_row, j)
+            if j == pivot_col:
+                self._set_tableau_value(pivot_row, j, Fraction(1))
+            elif val_pivot_row_j != Fraction(0) : # Only perform division if original value was non-zero
+                self._set_tableau_value(pivot_row, j, val_pivot_row_j / pivot_element)
+            # If val_pivot_row_j was 0, it remains 0 after division by pivot_element (0/X=0), so no need to store.
 
-        # Eliminate other rows
+        # Eliminate other rows (make pivot_col entries zero for other rows)
         for i in range(self.rows):
             if i != pivot_row:
-                factor = self.tableau[i][pivot_col]
-                for j in range(self.cols):
-                    self.tableau[i][j] -= factor * self.tableau[pivot_row][j]
+                factor = self._get_tableau_value(i, pivot_col)
+                if factor != Fraction(0): # If factor is zero, this row doesn't need changes based on pivot_col
+                    # Iterate over all columns conceptually for row i
+                    for j in range(self.cols):
+                        val_i_j = self._get_tableau_value(i, j)
+                        val_pivot_row_j_normalized = self._get_tableau_value(pivot_row, j) # Value from normalized pivot row
+
+                        if j == pivot_col: # Element in pivot column (not in pivot row) becomes 0
+                            self._set_tableau_value(i, j, Fraction(0))
+                        else:
+                            # New value = current_val_i_j - factor * val_pivot_row_j_normalized
+                            # This needs to be calculated even if val_i_j is currently 0
+                            new_val = val_i_j - factor * val_pivot_row_j_normalized
+                            self._set_tableau_value(i, j, new_val)
 
     def _format_tableau(self):
-        """Formats the tableau for printing."""
+        """Formats the sparse tableau for printing by reconstructing a dense view."""
         s = []
-        col_widths = [0] * self.cols
-        for r in self.tableau:
-            for i, cell in enumerate(r):
-                col_widths[i] = max(col_widths[i], len(str(cell)))
+        # Create a dense representation for printing
+        dense_tableau_for_print = []
+        for i in range(self.rows):
+            row_list = []
+            for j in range(self.cols):
+                row_list.append(self._get_tableau_value(i,j))
+            dense_tableau_for_print.append(row_list)
 
-        for row in self.tableau:
-            s.append(" | ".join(str(x).ljust(col_widths[idx]) for idx, x in enumerate(row)))
+        col_widths = [0] * self.cols
+        for r_list in dense_tableau_for_print:
+            for idx, cell_val in enumerate(r_list):
+                col_widths[idx] = max(col_widths[idx], len(str(cell_val)))
+
+        header = []
+        for j in range(self.num_decision_vars):
+            header.append(f"x{j+1}".ljust(col_widths[j]))
+        for j in range(self.num_slack_vars):
+            header.append(f"s{j+1}".ljust(col_widths[self.num_decision_vars + j]))
+        header.append("P".ljust(col_widths[self.num_decision_vars + self.num_slack_vars]))
+        header.append("RHS".ljust(col_widths[self.cols - 1]))
+        s.append(" | ".join(header))
+        s.append("-+-".join(["-" * w for w in col_widths]))
+
+
+        for i in range(self.rows):
+            row_str_list = []
+            for j in range(self.cols):
+                val = self._get_tableau_value(i,j)
+                row_str_list.append(str(val).ljust(col_widths[j]))
+            s.append(" | ".join(row_str_list))
         return "\n".join(s)
 
     def solve(self, max_iterations=100, verbose=False):
@@ -162,6 +221,7 @@ class SimplexSolver:
         The final tableau and solution can be extracted from self.tableau.
         """
         self.iteration = 0
+        # Pass self.num_decision_vars and self.num_slack_vars to format_tableau if it needs them for headers
         if verbose: print(f"Initial Tableau (num_decision_vars={self.num_decision_vars}, num_slack_vars={self.num_slack_vars}):\n{self._format_tableau()}\n")
 
         while self.iteration < max_iterations:
@@ -171,30 +231,29 @@ class SimplexSolver:
                 if verbose: print("Optimal solution found.")
                 return "optimal"
 
-            if verbose: print(f"Iteration {self.iteration}: Pivot column is {pivot_col}")
+            if verbose: print(f"Iteration {self.iteration+1}: Pivot column is {pivot_col} (0-indexed)")
 
             pivot_row = self._find_pivot_row(pivot_col)
 
-            if pivot_row == -1:
-                # Check if all entries in pivot column (excluding obj row) are <= 0
-                # This is the condition for unboundedness.
-                all_non_positive = True
-                for i in range(self.rows -1):
-                    if self.tableau[i][pivot_col] > 0:
-                        all_non_positive = False
+            # Check for unboundedness: if a pivot column is identified, but all entries in that
+            # column (for constraint rows) are non-positive (<= 0).
+            if pivot_row == -1: # No valid pivot row found
+                all_pivot_col_entries_non_positive = True
+                for i in range(self.rows - 1): # Check all constraint rows
+                    if self._get_tableau_value(i, pivot_col) > 0:
+                        all_pivot_col_entries_non_positive = False
                         break
-                if all_non_positive:
-                    if verbose: print(f"Problem is unbounded. Pivot column {pivot_col} has all non-positive entries.")
+                if all_pivot_col_entries_non_positive:
+                    if verbose: print(f"Problem is unbounded. Pivot column {pivot_col} has all non-positive or zero entries in constraint rows.")
                     return "unbounded"
                 else:
-                    # This case should ideally not be reached if logic is correct.
-                    # It means a pivot column was found, but no valid pivot row (e.g. all ratios negative with positive divisors).
-                    # This might indicate issues with problem formulation or degeneracy handling not yet implemented.
-                    if verbose: print(f"Warning: Pivot column {pivot_col} found, but no valid pivot row according to ratio test. Check for problem setup or degeneracy.")
-                    return "error_no_pivot_row"
+                    # This could happen if, for example, all RHS values for potential pivot rows were negative.
+                    # The current _find_pivot_row skips rows with RHS < 0 if pivot_col_val > 0.
+                    if verbose: print(f"Warning: Pivot column {pivot_col} found, but no suitable pivot row. This might indicate issues with problem formulation (e.g. all valid ratios negative or undefined) or all RHS negative.")
+                    return "error_no_suitable_pivot_row"
 
 
-            if verbose: print(f"Pivot element at ({pivot_row}, {pivot_col}): {self.tableau[pivot_row][pivot_col]}")
+            if verbose: print(f"Pivot element at ({pivot_row}, {pivot_col}): {self._get_tableau_value(pivot_row, pivot_col)}")
 
             self._pivot(pivot_row, pivot_col)
             self.iteration += 1
@@ -205,46 +264,52 @@ class SimplexSolver:
 
     def get_solution(self):
         """
-        Extracts the variable values and objective function value from the final tableau.
+        Extracts the variable values and objective function value from the final (optimal) sparse tableau.
         Returns a dictionary with decision variable values (x1, x2, ...)
         and the objective function value keyed by 'objective_value'.
         """
         solution = {}
+        rhs_col_idx = self.cols - 1
+        obj_row_idx = self.rows - 1
+
         # Objective value is in the last row, last column
-        solution['objective_value'] = self.tableau[self.rows - 1][self.cols - 1]
+        solution['objective_value'] = self._get_tableau_value(obj_row_idx, rhs_col_idx)
 
         # Decision variables values
-        # A decision variable x_j (column j) is basic if its column has one 1 (in a constraint row i)
-        # and 0s in all other constraint rows, and its coefficient in the objective row is 0.
-        # Its value is then tableau[i][RHS_col_index].
-        # Otherwise, it's non-basic and its value is 0.
-
-        for j in range(self.num_decision_vars): # Iterate through columns of decision variables
-            is_basic = False
+        # A decision variable x_j (column j) is basic if its column in the final tableau
+        # has a single '1' in a constraint row (say row_basic) and all other entries
+        # in that column (for other constraint rows and the objective row) are '0'.
+        # Its value is then the RHS value of row_basic. Otherwise, it's non-basic and its value is 0.
+        for j in range(self.num_decision_vars): # Iterate through columns of original decision variables
             val = Fraction(0) # Default to 0 for non-basic variables
+            basic_row_candidate = -1
+            is_basic_column = True
 
-            # Check if column j is a basic variable column
-            one_count = 0
-            row_with_one = -1
-            other_coeffs_zero_in_constraints = True
+            # Check column j for basic variable characteristics
+            count_ones_in_constraints = 0
 
             for i in range(self.rows - 1): # Iterate through constraint rows
-                coeff = self.tableau[i][j]
-                if coeff == Fraction(1):
-                    one_count += 1
-                    row_with_one = i
-                elif coeff != Fraction(0):
-                    other_coeffs_zero_in_constraints = False
-                    break # Not a simple basic variable column
+                cell_val = self._get_tableau_value(i, j)
+                if cell_val == Fraction(1):
+                    count_ones_in_constraints += 1
+                    basic_row_candidate = i
+                elif cell_val != Fraction(0):
+                    is_basic_column = False # Other non-zero in constraint rows
+                    break
 
-            if one_count == 1 and other_coeffs_zero_in_constraints:
-                # It's a basic variable if its coefficient in objective row is also 0
-                # (or close to zero, due to potential floating point issues if not using Fraction, but we are)
-                if self.tableau[self.rows - 1][j] == Fraction(0):
-                    is_basic = True
-                    val = self.tableau[row_with_one][self.cols - 1]
+            if not is_basic_column or count_ones_in_constraints != 1:
+                solution[f'x{j+1}'] = Fraction(0) # Non-basic or complex column
+                continue
 
-            solution[f'x{j+1}'] = val # Store as x1, x2, ...
+            # Check if the objective row coefficient for this column is zero
+            if self._get_tableau_value(obj_row_idx, j) == Fraction(0):
+                # This column j corresponds to a basic variable, its value is on RHS of basic_row_candidate
+                val = self._get_tableau_value(basic_row_candidate, rhs_col_idx)
+            else:
+                # Column might look basic in constraints, but if obj func coeff is non-zero, it's non-basic.
+                val = Fraction(0)
+
+            solution[f'x{j+1}'] = val
 
         return solution
 
@@ -258,8 +323,10 @@ if __name__ == '__main__':
     ]
     b1 = [Fraction(10), Fraction(15)]
 
-    initial_tab1, n_dec_vars1, n_slack_vars1 = initialize_tableau(c1, A1, b1)
-    solver1 = SimplexSolver(initial_tab1, n_dec_vars1, n_slack_vars1)
+    # MODIFIED: initialize_tableau now returns 5 values
+    sparse_tab1, n_dec_vars1, n_constraints1, n_rows1, n_cols1 = initialize_tableau(c1, A1, b1)
+    # MODIFIED: SimplexSolver constructor takes new arguments
+    solver1 = SimplexSolver(sparse_tab1, n_dec_vars1, n_constraints1, n_rows1, n_cols1)
 
     print("--- Example 1 (Optimal) ---")
     # print("Initial Tableau (Example 1):")
@@ -287,8 +354,8 @@ if __name__ == '__main__':
     ]
     b2 = [Fraction(1), Fraction(2)]
 
-    initial_tab2, n_dec_vars2, n_slack_vars2 = initialize_tableau(c2, A2, b2)
-    solver2 = SimplexSolver(initial_tab2, n_dec_vars2, n_slack_vars2)
+    sparse_tab2, n_dec_vars2, n_constraints2, n_rows2, n_cols2 = initialize_tableau(c2, A2, b2)
+    solver2 = SimplexSolver(sparse_tab2, n_dec_vars2, n_constraints2, n_rows2, n_cols2)
 
     print("\n--- Example 2 (Unbounded) ---")
     # print("Initial Tableau (Example 2):")
@@ -318,8 +385,8 @@ if __name__ == '__main__':
     ]
     b3 = [Fraction(10), Fraction(15)]
 
-    initial_tab3, n_dec_vars3, n_slack_vars3 = initialize_tableau(c3, A3, b3)
-    solver3 = SimplexSolver(initial_tab3, n_dec_vars3, n_slack_vars3)
+    sparse_tab3, n_dec_vars3, n_constraints3, n_rows3, n_cols3 = initialize_tableau(c3, A3, b3)
+    solver3 = SimplexSolver(sparse_tab3, n_dec_vars3, n_constraints3, n_rows3, n_cols3)
     print("\n--- Example 3 (Wikipedia) ---")
     status3 = solver3.solve(verbose=True) # Set verbose=True for detailed output
     print(f"\nSolver status (Example 3): {status3}")
