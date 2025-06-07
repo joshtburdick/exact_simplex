@@ -54,7 +54,8 @@ First, import the necessary components and define your problem using coefficient
 
 ```python
 from fractions import Fraction
-from simplex_algorithm.simplex import initialize_tableau, SimplexSolver
+# initialize_tableau is an internal function; SimplexSolver is the public interface.
+from simplex_algorithm.simplex import SimplexSolver
 
 # Example Problem:
 # Maximize P = 3x1 + 2x2
@@ -76,20 +77,85 @@ A = [
 b = [Fraction(10), Fraction(15)] # Corresponding to <= 10 and <= 15
 ```
 
-### Solving the Problem
-Next, initialize the tableau and the solver, then call the `solve()` method:
+For problems with many variables where most coefficients are zero, a sparse input format can be more convenient. See the "Using Sparse Input Format" section below for details.
+
+### Using Sparse Input Format
+
+For problems where the objective function `c` or constraint matrix `A` are sparse (i.e., contain many zero coefficients), you can provide them as dictionaries. This can be more readable and potentially more efficient for tableau initialization if the problem is very large and very sparse.
+
+-   **`c` (objective function coefficients):** A dictionary where keys are 0-indexed integer variable numbers and values are `Fraction` coefficients. Variables not included in the dictionary are assumed to have a coefficient of zero.
+    Example: `c_sparse = {0: Fraction(3), 2: Fraction(2)}` represents \(P = 3x_1 + 0x_2 + 2x_3\).
+-   **`A` (constraint matrix):** A list of dictionaries. Each dictionary represents a constraint row, with keys as 0-indexed integer variable numbers and values as `Fraction` coefficients.
+    Example: `A_sparse = [{0: Fraction(1), 1: Fraction(1)}, {0: Fraction(2), 2: Fraction(1)}]`.
+-   **`b` (RHS values):** Remains a list of `Fraction` objects, corresponding to each constraint row in `A_sparse`.
+
+To use this format, pass `sparse_input=True` when creating the `SimplexSolver` instance:
 
 ```python
-# Initialize the tableau
-# This returns the tableau, number of decision variables, and number of slack variables
-tableau, num_decision_vars, num_slack_vars = initialize_tableau(c, A, b)
+from fractions import Fraction
+from simplex_algorithm.simplex import SimplexSolver
+
+# Example Sparse Problem:
+# Maximize P = 3x1 + 0x2 + 2x3  (Note: x2 has coefficient 0)
+# Subject to:
+#   1x1 + 1x2 + 0x3 <= 10
+#   2x1 + 0x2 + 1x3 <= 15
+#   x1, x2, x3 >= 0
+
+c_sparse = {0: Fraction(3), 2: Fraction(2)}  # x2's objective coefficient is 0
+A_sparse = [
+    {0: Fraction(1), 1: Fraction(1)},      # Constraint 1: 1x1 + 1x2 (+ 0x3)
+    {0: Fraction(2), 2: Fraction(1)}       # Constraint 2: 2x1 (+ 0x2) + 1x3
+]
+b_rhs = [Fraction(10), Fraction(15)]
+
+# Initialize SimplexSolver with sparse_input=True
+# The solver will determine the total number of decision variables based on the maximum index found in c_sparse and A_sparse.
+# In this example, max index is 2, so it assumes 3 decision variables (x1, x2, x3, indexed 0, 1, 2).
+solver = SimplexSolver(c_sparse, A_sparse, b_rhs, sparse_input=True)
+
+# Then proceed as usual:
+# status = solver.solve()
+# if status == "optimal":
+#     solution = solver.get_solution()
+#     print(solution)
+```
+
+### Solving the Problem
+Create a `SimplexSolver` instance with your problem definition (using either the standard list format or the sparse dictionary format as described above). Then, call the `solve()` method:
+
+```python
+# Using the standard problem definition from the first example:
+c_dense = [Fraction(3), Fraction(2)]
+A_dense = [
+    [Fraction(1), Fraction(1)],
+    [Fraction(2), Fraction(1)]
+]
+b_dense = [Fraction(10), Fraction(15)]
 
 # Create a SimplexSolver instance
-solver = SimplexSolver(tableau, num_decision_vars, num_slack_vars)
+solver = SimplexSolver(c_dense, A_dense, b_dense)
+# For sparse input, you would use:
+# solver = SimplexSolver(c_sparse, A_sparse, b_rhs, sparse_input=True)
 
 # Solve the problem
 status = solver.solve()
 # You can also use solver.solve(verbose=True) for step-by-step output
+
+# Example using the sparse definition from above:
+# c_sparse = {0: Fraction(3), 2: Fraction(2)}
+# A_sparse = [
+#     {0: Fraction(1), 1: Fraction(1)},
+#     {0: Fraction(2), 2: Fraction(1)}
+# ]
+# b_rhs = [Fraction(10), Fraction(15)]
+# solver_sparse = SimplexSolver(c_sparse, A_sparse, b_rhs, sparse_input=True)
+# status_sparse = solver_sparse.solve()
+# print(f"Sparse solver status: {status_sparse}")
+# if status_sparse == "optimal":
+#     solution_sparse = solver_sparse.get_solution()
+#     print(solution_sparse)
+
 ```
 
 ### Interpreting the Solution
