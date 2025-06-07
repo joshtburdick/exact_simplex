@@ -1,52 +1,76 @@
 from fractions import Fraction
 
-def initialize_tableau(c, A, b):
+def initialize_tableau(c, A_orig, b_orig):
     """
-    Initializes the simplex tableau from the problem statement:
+    Initializes the simplex tableau.
     Maximize P = c'x
-    Subject to Ax <= b, x >= 0
+    Subject to Ax <= b (or Ax >= b if b_i was negative)
+    This function ensures all RHS values (b) are non-negative in the tableau.
+    If b_i < 0 for a constraint A_i x <= b_i, it's converted to
+    -A_i x >= -b_i. A surplus variable e_i is added: -A_i x - e_i = -b_i.
 
     Args:
         c: List of coefficients for the objective function (decision variables).
-        A: List of lists representing the constraint matrix.
-        b: List of RHS values for constraints.
+        A_orig: List of lists representing the constraint matrix.
+        b_orig: List of RHS values for constraints.
 
     Returns:
-        sparse_tableau: A dictionary where keys are (row_idx, col_idx) tuples and
-                        values are Fraction objects representing non-zero elements.
+        sparse_tableau: Dictionary {(row, col): Fraction_value}.
         num_decision_vars: Number of original decision variables.
-        num_constraints: Number of constraints (also number of slack variables).
-        num_tableau_rows: Total rows in the conceptual tableau.
-        num_tableau_cols: Total columns in the conceptual tableau.
+        num_aux_vars: Number of auxiliary (slack/surplus) variables.
+        num_tableau_rows: Total rows in the tableau.
+        num_tableau_cols: Total columns in the tableau.
+        constraint_types: List of strings ('slack' or 'surplus') for each constraint.
     """
     num_decision_vars = len(c)
-    num_constraints = len(A)
+    num_constraints = len(A_orig) # This is also num_aux_vars
 
-    if num_constraints != len(b):
+    if num_constraints != len(b_orig):
         raise ValueError("Number of constraints in A must match number of RHS values in b.")
-    for constraint_row_idx, row_coeffs in enumerate(A):
+    for constraint_row_idx, row_coeffs in enumerate(A_orig):
         if len(row_coeffs) != num_decision_vars:
             raise ValueError(f"Constraint row {constraint_row_idx} in A must have num_decision_vars ({num_decision_vars}) elements.")
 
+    A = [list(row) for row in A_orig] # Create copies to modify
+    b = list(b_orig)
+    constraint_types = []
+
     num_tableau_rows = num_constraints + 1
-    # Columns: decision_vars + slack_vars + P_var + RHS_value
+    # Columns: decision_vars + aux_vars (slack/surplus) + P_var + RHS_value
     num_tableau_cols = num_decision_vars + num_constraints + 1 + 1
 
     sparse_tableau = {}
 
     # Constraint rows
     for i in range(num_constraints):
+        current_A_row = A[i]
+        current_b_val = b[i]
+
+        if current_b_val < 0:
+            # Multiply constraint by -1: -A_i x >= -b_i (becomes positive)
+            # Add surplus variable e_i: -A_i x - e_i = -b_i
+            current_A_row = [-coeff for coeff in current_A_row]
+            current_b_val = -current_b_val
+            constraint_types.append('surplus')
+            aux_var_coeff = Fraction(-1)
+        else:
+            # Original A_i x <= b_i
+            # Add slack variable s_i: A_i x + s_i = b_i
+            constraint_types.append('slack')
+            aux_var_coeff = Fraction(1)
+
         # Decision variable coefficients
-        for j, x_coeff in enumerate(A[i]):
-            if x_coeff != 0: # Only store non-zero values
+        for j, x_coeff in enumerate(current_A_row):
+            if x_coeff != 0:
                 sparse_tableau[(i, j)] = Fraction(x_coeff)
-        # Slack variable coefficients
-        # s_i coefficient is 1 for constraint row i, 0 otherwise
-        sparse_tableau[(i, num_decision_vars + i)] = Fraction(1) # This is always 1, so store it
-        # Coefficient for P (objective variable) is 0 in constraint rows, so don't store
+
+        # Auxiliary (slack or surplus) variable coefficient
+        # For constraint row i, aux_var_i has its specific coefficient, 0 otherwise
+        sparse_tableau[(i, num_decision_vars + i)] = aux_var_coeff
+
         # RHS
-        if b[i] != 0: # Only store non-zero values
-            sparse_tableau[(i, num_tableau_cols - 1)] = Fraction(b[i])
+        if current_b_val != 0: # Should always be non-negative now
+            sparse_tableau[(i, num_tableau_cols - 1)] = Fraction(current_b_val)
 
     # Objective function row (last row)
     obj_row_idx = num_constraints
@@ -54,29 +78,297 @@ def initialize_tableau(c, A, b):
     for j, c_coeff in enumerate(c):
         if c_coeff != 0: # Only store non-zero values
             sparse_tableau[(obj_row_idx, j)] = Fraction(-c_coeff)
-    # Slack variable coefficients in objective function are 0, so don't store
+    # Auxiliary variable coefficients in objective function are 0, so don't store
     # Coefficient for P is 1
     sparse_tableau[(obj_row_idx, num_decision_vars + num_constraints)] = Fraction(1) # This is always 1
     # RHS for objective function is 0, so don't store
 
-    return sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols
+    return sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols, constraint_types
+
+# Helper function to set values in sparse tableau dictionary
+def _set_sparse_val(target_dict, r, c, val):
+    if val == Fraction(0):
+        target_dict.pop((r, c), None)
+    else:
+        target_dict[(r, c)] = val
+
+def _helper_canonicalize_objective_row(tableau_to_modify, objective_row_index,
+                                     variable_columns_to_check_range, all_tableau_columns_range,
+                                     constraint_rows_range, verbose=False):
+    """
+    Makes the specified objective row canonical with respect to basic variables.
+    A variable is basic in a row if it has a coefficient of 1 in that row and 0 in all other constraint rows for that column.
+    If a basic variable (from variable_columns_to_check_range) has a non-zero coefficient
+    in the objective row, row operations are performed to make it zero.
+
+    Args:
+        tableau_to_modify: The sparse dict representing the tableau.
+        objective_row_index: Index of the row to be made canonical.
+        variable_columns_to_check_range: e.g., range(num_vars_total_non_obj_non_rhs)
+        all_tableau_columns_range: e.g., range(total_cols_including_rhs)
+        constraint_rows_range: e.g., range(objective_row_index)
+        verbose: Boolean for logging.
+    """
+    if verbose: print("Making objective row canonical...")
+    for j_col in variable_columns_to_check_range:
+        coeff_in_obj_row = tableau_to_modify.get((objective_row_index, j_col), Fraction(0))
+
+        if coeff_in_obj_row == Fraction(0):
+            continue # Already canonical for this variable column in the objective row.
+
+        # Check if j_col is basic in one of the constraint_rows_range
+        basic_row_idx = -1
+        num_ones_in_col = 0
+        non_zero_other_than_one_in_constr_rows = False
+
+        for r_chk in constraint_rows_range:
+            val_in_constr = tableau_to_modify.get((r_chk, j_col), Fraction(0))
+            if val_in_constr == Fraction(1):
+                if num_ones_in_col == 0: # First '1' found
+                    basic_row_idx = r_chk
+                num_ones_in_col += 1
+            elif val_in_constr != Fraction(0):
+                non_zero_other_than_one_in_constr_rows = True
+                break
+
+        if num_ones_in_col == 1 and not non_zero_other_than_one_in_constr_rows:
+            # j_col is basic in basic_row_idx and its coeff_in_obj_row is non-zero.
+            # This is the variable/row we need to use for canonicalization.
+            if verbose: print(f"  Var in col {j_col} is basic in row {basic_row_idx}. Obj coeff is {coeff_in_obj_row}. Pivoting obj row.")
+
+            # ObjRow_new = ObjRow_old - coeff_in_obj_row * BasicRow(basic_row_idx)
+            for op_col in all_tableau_columns_range:
+                obj_val_at_op_col = tableau_to_modify.get((objective_row_index, op_col), Fraction(0))
+                basic_row_val_at_op_col = tableau_to_modify.get((basic_row_idx, op_col), Fraction(0))
+
+                new_obj_val = obj_val_at_op_col - coeff_in_obj_row * basic_row_val_at_op_col
+                _set_sparse_val(tableau_to_modify, objective_row_index, op_col, new_obj_val)
+        # else: j_col is not basic in a unique constraint row, or its obj_coeff was already zero.
+        # If coeff_in_obj_row was non-zero but var j_col was not basic, that's fine, no op needed for this col.
+
+def construct_phase1_tableau(initial_tableau_data):
+    """
+    Constructs the Phase 1 tableau for the simplex algorithm.
+    Phase 1 is used when artificial variables are needed (e.g., for surplus variables
+    resulting from >= constraints, or for equality constraints).
+    The goal of Phase 1 is to find a basic feasible solution by minimizing the sum
+    of artificial variables. If the minimum sum is > 0, the original problem is infeasible.
+
+    Args:
+        initial_tableau_data: A tuple containing the output from initialize_tableau:
+            (sparse_tableau_in, num_decision_vars, num_aux_vars,
+             num_tableau_rows_in, num_tableau_cols_in, constraint_types_in)
+
+    Returns:
+        A tuple: (phase1_tableau, phase1_dims, artificial_var_info,
+                  saved_original_obj_coeffs, constraint_types_in)
+        OR
+        (None, "No Phase 1 needed", initial_tableau_data, saved_original_obj_coeffs)
+        if no artificial variables are required.
+
+        phase1_tableau: Sparse dictionary for the Phase 1 problem.
+        phase1_dims: Tuple with dimensions and key column indices for Phase 1 tableau
+                     (p1_num_decision_vars, p1_num_aux_vars, p1_num_artificial_vars,
+                      p1_num_tableau_rows, p1_num_tableau_cols, p1_W_var_col_idx, p1_rhs_col_idx).
+        artificial_var_info: List of dicts, [{'original_row': r_idx, 'art_var_col': col_idx}]
+                             mapping original constraint rows to their artificial variable columns.
+        saved_original_obj_coeffs: Dictionary storing the original objective function coefficients.
+        constraint_types_in: Passed through from input.
+    """
+    sparse_tableau_in, num_decision_vars, num_aux_vars, \
+    num_tableau_rows_in, num_tableau_cols_in, constraint_types_in = initial_tableau_data
+
+    phase1_tableau = {}
+    artificial_var_info = []
+    num_artificial_vars = 0
+    # Artificial variables are added after decision and aux variables
+    art_var_col_start_idx = num_decision_vars + num_aux_vars
+    current_art_var_col = art_var_col_start_idx
+
+    # 1. Identify rows needing artificial variables and map columns
+    # Artificial variables are needed for rows that had surplus variables.
+    # (original_row refers to the row index in sparse_tableau_in)
+    for i in range(len(constraint_types_in)):
+        if constraint_types_in[i] == 'surplus':
+            # This row 'i' in the original problem now needs an artificial variable.
+            # The artificial variable will get its own column in the phase 1 tableau.
+            artificial_var_info.append({'original_row': i, 'art_var_col': current_art_var_col})
+            num_artificial_vars += 1
+            current_art_var_col += 1
+
+    # 2. Save Original Objective Row Coefficients
+    # These are needed to reconstruct the tableau for Phase 2.
+    saved_original_obj_coeffs = {}
+    obj_row_idx_in = num_tableau_rows_in - 1
+    # Columns in original tableau: decision_vars | aux_vars | P_var | RHS
+    old_P_var_col_idx_in = num_decision_vars + num_aux_vars
+    old_rhs_col_idx_in = num_tableau_cols_in - 1
+
+    # Iterate through decision and auxiliary variable columns in the original objective row
+    for j in range(old_P_var_col_idx_in): # Covers decision_vars and aux_vars
+        val = sparse_tableau_in.get((obj_row_idx_in, j), Fraction(0))
+        if val != Fraction(0):
+            saved_original_obj_coeffs[j] = val
+
+    # Save P coefficient and RHS from original objective row
+    # The P var itself might not be explicitly in saved_original_obj_coeffs if we reconstruct carefully,
+    # but saving its column index and value (should be 1) is good.
+    # Let's save all parts of the original objective row, including P and RHS.
+    # The key for saved_original_obj_coeffs will be the column index.
+    val_P = sparse_tableau_in.get((obj_row_idx_in, old_P_var_col_idx_in), Fraction(0))
+    if val_P != Fraction(0): # Should be 1 for P
+         saved_original_obj_coeffs[old_P_var_col_idx_in] = val_P
+
+    val_rhs = sparse_tableau_in.get((obj_row_idx_in, old_rhs_col_idx_in), Fraction(0))
+    if val_rhs != Fraction(0): # Original objective value, usually 0
+        saved_original_obj_coeffs[old_rhs_col_idx_in] = val_rhs
+
+    # 3. Handle "No Phase 1 Needed" case
+    if num_artificial_vars == 0:
+        # No artificial variables means the initial solution (with slacks) is feasible.
+        return (None, "No Phase 1 needed", initial_tableau_data, saved_original_obj_coeffs, constraint_types_in)
+
+    # 4. Define Phase 1 Tableau Dimensions
+    p1_num_decision_vars = num_decision_vars
+    p1_num_aux_vars = num_aux_vars
+    p1_num_artificial_vars = num_artificial_vars
+
+    # Columns: decision_vars | aux_vars | artificial_vars | W_var | RHS
+    p1_W_var_col_idx = p1_num_decision_vars + p1_num_aux_vars + p1_num_artificial_vars
+    p1_rhs_col_idx = p1_W_var_col_idx + 1
+    p1_num_tableau_cols = p1_rhs_col_idx + 1
+
+    p1_num_tableau_rows = num_tableau_rows_in # Number of rows remains the same
+    p1_obj_row_idx = p1_num_tableau_rows - 1
+
+    # Helper for setting values in sparse tableau is now defined globally as _set_sparse_val
+
+    # 5. Construct Phase 1 Tableau (Constraint Rows)
+    # Copy from sparse_tableau_in to phase1_tableau
+    # For each constraint row r from 0 to p1_obj_row_idx - 1:
+    for r in range(p1_obj_row_idx):
+        # Copy decision variable coefficients
+        for c_dec in range(p1_num_decision_vars):
+            val = sparse_tableau_in.get((r, c_dec), Fraction(0))
+            _set_sparse_val(phase1_tableau, r, c_dec, val)
+
+        # Copy auxiliary variable coefficients
+        # Original aux var columns are from num_decision_vars to num_decision_vars + num_aux_vars - 1
+        # New aux var columns are also from p1_num_decision_vars to p1_num_decision_vars + p1_num_aux_vars - 1
+        for c_aux_offset in range(p1_num_aux_vars):
+            orig_aux_col = num_decision_vars + c_aux_offset
+            new_aux_col = p1_num_decision_vars + c_aux_offset
+            val = sparse_tableau_in.get((r, orig_aux_col), Fraction(0))
+            _set_sparse_val(phase1_tableau, r, new_aux_col, val)
+
+        # Copy RHS
+        val = sparse_tableau_in.get((r, old_rhs_col_idx_in), Fraction(0))
+        _set_sparse_val(phase1_tableau, r, p1_rhs_col_idx, val)
+
+    # Add artificial variable coefficients (column of 1s for each art_var in its row)
+    for art_info in artificial_var_info:
+        # art_info['original_row'] is the row index
+        # art_info['art_var_col'] is the column index for this new artificial variable
+        _set_sparse_val(phase1_tableau, art_info['original_row'], art_info['art_var_col'], Fraction(1))
+
+    # 6. Create Initial Phase 1 Objective Row (W)
+    # Objective: Minimize sum of artificial variables (e.g., a1 + a2 + ...)
+    # This is equivalent to Maximize W = -(a1 + a2 + ...) => W + a1 + a2 + ... = 0
+    # So, coefficients of artificial variables in W row are 1.
+    # To match the tableau format (obj_coeff = -actual_coeff), we use -1 for art_vars.
+    # However, standard Phase 1 setup for maximization tableau: W = Sum(art_vars), then make canonical.
+    # Let's set up to Maximize W = - (sum of art_vars).
+    # The objective row for "Maximize W = -a1 -a2 ..." is  W + a1 + a2 + ... = 0
+    # This means obj coeffs for a_i are 1. Then pivot to make them 0.
+    # Let's use the common approach: W = sum of artificial variables, then subtract rows.
+    # Obj: Min (a_i). So Max (- sum a_i). Let W = -sum(a_i).
+    # W + a_1 + a_2 + ... = 0.  Tableau row: [ ... 1 1 ... 1(W) 0(RHS) ]
+    # where 1s are for a_i.
+
+    # Initial W row: set coefficients for artificial variables to 1.
+    for art_info in artificial_var_info:
+        _set_sparse_val(phase1_tableau, p1_obj_row_idx, art_info['art_var_col'], Fraction(1)) # Coeff for art_var_i is 1
+
+    _set_sparse_val(phase1_tableau, p1_obj_row_idx, p1_W_var_col_idx, Fraction(1)) # Coeff for W is 1
+    _set_sparse_val(phase1_tableau, p1_obj_row_idx, p1_rhs_col_idx, Fraction(0))   # RHS for W is 0
+
+    # 7. Make Phase 1 Objective Row Consistent (Canonical Form)
+    # For each artificial variable a_k (which is basic in row i_k, with coefficient 1):
+    # New W_row = Old W_row - Row_i_k (for each artificial var that was made basic)
+    # This is now handled by a general canonicalization helper.
+    # The W-row was set up with 1s for artificial variables. These are the ones that need to be zeroed out.
+    # The variable_columns_to_check_range should cover all variables that might be basic,
+    # but specifically, we are interested in the artificial variable columns that were just made basic.
+    # The logic inside _helper_canonicalize_objective_row will find any basic var in its range
+    # that has a non-zero coefficient in the objective row and fix it.
+    # For Phase 1, the artificial variables are basic in their respective constraint rows (coeff 1),
+    # and have a coeff of 1 in the W-row before this step.
+    _helper_canonicalize_objective_row(
+        phase1_tableau,
+        p1_obj_row_idx,
+        range(p1_W_var_col_idx), # Check all var cols: decision, aux, artificial
+        range(p1_num_tableau_cols), # Operate on all cols: decision, aux, art, W, RHS
+        range(p1_obj_row_idx), # Constraint rows range
+        verbose=False # construct_phase1_tableau does not currently take verbose flag
+    )
+
+    # 8. Return Phase 1 Data
+    phase1_dims = (p1_num_decision_vars, p1_num_aux_vars, p1_num_artificial_vars,
+                   p1_num_tableau_rows, p1_num_tableau_cols,
+                   p1_W_var_col_idx, p1_rhs_col_idx)
+
+    return phase1_tableau, phase1_dims, artificial_var_info, saved_original_obj_coeffs, constraint_types_in
+
 
 class SimplexSolver:
-    def __init__(self, sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols):
+    def __init__(self, c_orig, A_orig, b_orig):
         """
-        Initializes the SimplexSolver with a sparse tableau and problem dimensions.
-        sparse_tableau: Dictionary {(row, col): Fraction_value}
-        num_decision_vars: Number of original decision variables.
-        num_constraints: Number of constraints (used as num_slack_vars).
-        num_tableau_rows: Total conceptual rows in the tableau.
-        num_tableau_cols: Total conceptual columns in the tableau.
+        Initializes the SimplexSolver with the problem definition.
+        It sets up for Phase 1 if needed, otherwise prepares for direct solution.
+        Args:
+            c_orig: List of coefficients for the objective function.
+            A_orig: List of lists representing the constraint matrix.
+            b_orig: List of RHS values for constraints.
         """
-        self.tableau = sparse_tableau # This is now a dictionary
-        self.rows = num_tableau_rows
-        self.cols = num_tableau_cols
-        self.num_decision_vars = num_decision_vars
-        # num_constraints is the number of slack variables for Ax <= b form
-        self.num_slack_vars = num_constraints
+        initial_tableau_data = initialize_tableau(c_orig, A_orig, b_orig)
+        # sparse_tableau_in, num_decision_vars, num_aux_vars, num_rows_in, num_cols_in, constraint_types_in
+
+        self.original_num_decision_vars = initial_tableau_data[1]
+        self.constraint_types = initial_tableau_data[5] # constraint_types_in
+
+        phase1_result = construct_phase1_tableau(initial_tableau_data)
+        p1_tableau, p1_dims, p1_art_var_info, p1_saved_orig_obj_coeffs, _ = phase1_result
+
+        self.saved_original_obj_coeffs = p1_saved_orig_obj_coeffs
+        self.artificial_var_info = p1_art_var_info # List of dicts {'original_row': r, 'art_var_col': c}
+
+        if p1_tableau is not None: # Phase 1 is needed
+            self.is_phase1_needed = True
+            self.current_phase = 1
+            self.tableau = p1_tableau
+            # Unpack p1_dims: (p1_num_decision_vars, p1_num_aux_vars, p1_num_artificial_vars,
+            #                  p1_num_tableau_rows, p1_num_tableau_cols,
+            #                  p1_W_var_col_idx, p1_rhs_col_idx)
+            self.num_decision_vars = p1_dims[0] # These are original decision vars
+            self.num_aux_vars = p1_dims[1]
+            self.num_artificial_vars = p1_dims[2]
+            self.rows = p1_dims[3]
+            self.cols = p1_dims[4]
+            self.objective_var_col_idx = p1_dims[5] # W_var_col_idx for Phase 1
+            self.rhs_col_idx = p1_dims[6]
+        else: # No Phase 1 needed
+            self.is_phase1_needed = False
+            self.current_phase = 2 # Proceed directly to Phase 2 logic
+            self.tableau = initial_tableau_data[0] # sparse_tableau_in
+            self.num_decision_vars = initial_tableau_data[1]
+            self.num_aux_vars = initial_tableau_data[2]
+            self.num_artificial_vars = 0
+            self.rows = initial_tableau_data[3]
+            self.cols = initial_tableau_data[4]
+            # Objective var (P) is after decision and aux vars
+            self.objective_var_col_idx = self.num_decision_vars + self.num_aux_vars
+            self.rhs_col_idx = self.cols - 1
+
         self.iteration = 0
 
     def _get_tableau_value(self, row, col):
@@ -85,11 +377,7 @@ class SimplexSolver:
 
     def _set_tableau_value(self, row, col, value):
         """Helper to set value in sparse tableau. Removes entry if value is zero."""
-        if value == Fraction(0):
-            # Remove the key if it exists and value is zero
-            self.tableau.pop((row, col), None)
-        else:
-            self.tableau[(row, col)] = value
+        _set_sparse_val(self.tableau, row, col, value) # Use the global helper
 
     def _find_pivot_column(self):
         """Finds the pivot column (entering variable).
@@ -99,8 +387,8 @@ class SimplexSolver:
         objective_row_idx = self.rows - 1
         min_val = Fraction(0)
         pivot_col = -1
-        # Only consider decision and slack variables for entering, not P or RHS
-        for j in range(self.num_decision_vars + self.num_slack_vars):
+        # Iterate through decision, auxiliary, and artificial (if phase 1) variable columns
+        for j in range(self.objective_var_col_idx): # Columns up to P or W variable
             val = self._get_tableau_value(objective_row_idx, j)
             if val < min_val:
                 min_val = val
@@ -110,22 +398,17 @@ class SimplexSolver:
     def _find_pivot_row(self, pivot_col):
         """Finds the pivot row (leaving variable) using the minimum ratio test.
         Returns the row index or -1 if unbounded or other issue.
+        Assumes RHS is non-negative (handled by initialize_tableau).
         """
         min_ratio = float('inf')
         pivot_row = -1
-        rhs_col_idx = self.cols - 1
+        # rhs_col_idx is now self.rhs_col_idx (set in __init__)
 
         for i in range(self.rows - 1): # Exclude objective function row
             pivot_col_val = self._get_tableau_value(i, pivot_col)
 
             if pivot_col_val > Fraction(0): # Consider only positive elements in pivot column
-                rhs_val = self._get_tableau_value(i, rhs_col_idx)
-
-                # Standard simplex assumes non-negative RHS for ratio test.
-                # If rhs_val is negative, this row should not be chosen by standard ratio test.
-                # (or indicates need for dual simplex or problem re-formulation)
-                if rhs_val < Fraction(0):
-                    continue # Skip rows with negative RHS for this simple implementation
+                rhs_val = self._get_tableau_value(i, self.rhs_col_idx) # Should be non-negative
 
                 # Ratio test: RHS / pivot_col_val
                 # If rhs_val is 0 and pivot_col_val > 0, ratio is 0. This is a valid and often preferred pivot.
@@ -137,7 +420,8 @@ class SimplexSolver:
                 # Note: Degeneracy (multiple rows with same min_ratio) is not specially handled here.
                 # Bland's rule could be implemented to prevent cycling in degenerate cases.
 
-        return pivot_row # Will be -1 if no suitable row (e.g. all pivot_col_val <= 0 or all valid RHS < 0)
+        # If all pivot_col_val <= 0 for rows with rhs_val >=0, then pivot_row remains -1 (unbounded)
+        return pivot_row
 
 
     def _pivot(self, pivot_row, pivot_col):
@@ -179,7 +463,6 @@ class SimplexSolver:
     def _format_tableau(self):
         """Formats the sparse tableau for printing by reconstructing a dense view."""
         s = []
-        # Create a dense representation for printing
         dense_tableau_for_print = []
         for i in range(self.rows):
             row_list = []
@@ -193,15 +476,34 @@ class SimplexSolver:
                 col_widths[idx] = max(col_widths[idx], len(str(cell_val)))
 
         header = []
-        for j in range(self.num_decision_vars):
-            header.append(f"x{j+1}".ljust(col_widths[j]))
-        for j in range(self.num_slack_vars):
-            header.append(f"s{j+1}".ljust(col_widths[self.num_decision_vars + j]))
-        header.append("P".ljust(col_widths[self.num_decision_vars + self.num_slack_vars]))
-        header.append("RHS".ljust(col_widths[self.cols - 1]))
+        # Decision variables (always use self.original_num_decision_vars for x_i labels)
+        for j in range(self.original_num_decision_vars):
+             header.append(f"x{j+1}".ljust(col_widths[j]))
+
+        current_col_offset = self.original_num_decision_vars
+
+        # Auxiliary variables
+        for j in range(self.num_aux_vars):
+            var_type_char = 's' if self.constraint_types[j] == 'slack' else 'e'
+            header.append(f"{var_type_char}{j+1}".ljust(col_widths[current_col_offset + j]))
+        current_col_offset += self.num_aux_vars
+
+        # Artificial variables (if any)
+        if self.current_phase == 1 or self.num_artificial_vars > 0 : # Check num_artificial_vars for safety
+            for j in range(self.num_artificial_vars):
+                 header.append(f"a{j+1}".ljust(col_widths[current_col_offset + j]))
+        # current_col_offset += self.num_artificial_vars # Not needed if objective_var_col_idx is used directly
+
+        # Objective variable (P or W)
+        # Use self.current_phase to determine W or P for the currently active tableau
+        active_obj_var_char = "W" if self.current_phase == 1 else "P"
+        header.append(active_obj_var_char.ljust(col_widths[self.objective_var_col_idx]))
+
+        # RHS
+        header.append("RHS".ljust(col_widths[self.rhs_col_idx]))
+
         s.append(" | ".join(header))
         s.append("-+-".join(["-" * w for w in col_widths]))
-
 
         for i in range(self.rows):
             row_str_list = []
@@ -211,47 +513,51 @@ class SimplexSolver:
             s.append(" | ".join(row_str_list))
         return "\n".join(s)
 
-    def solve(self, max_iterations=100, verbose=False):
+    def _execute_simplex_iterations(self, verbose=False, max_iterations=100):
         """
-        Solves the linear programming problem using the simplex method.
-        Returns:
-            - 'optimal': if an optimal solution is found.
-            - 'unbounded': if the problem is unbounded.
-            - 'max_iterations_reached': if max iterations are hit.
-        The final tableau and solution can be extracted from self.tableau.
+        Core simplex algorithm loop. Operates on the current self.tableau.
         """
-        self.iteration = 0
-        # Pass self.num_decision_vars and self.num_slack_vars to format_tableau if it needs them for headers
-        if verbose: print(f"Initial Tableau (num_decision_vars={self.num_decision_vars}, num_slack_vars={self.num_slack_vars}):\n{self._format_tableau()}\n")
+        # self.iteration should be managed by the caller if called multiple times (e.g. phase1 then phase2)
+        # For now, let it be reset or continued if solve() calls this multiple times.
+        # Let's assume it's reset for each call to solve -> _execute_simplex_iterations
+        # self.iteration = 0 # Resetting here means iterations are per-phase.
+
+        if verbose:
+            phase_name = "Phase 1" if self.current_phase == 1 else "Phase 2"
+            print(f"\n--- Starting {phase_name} ---")
+            title = f"Initial {phase_name} Tableau"
+            if self.current_phase == 1:
+                 title += f" (Dec={self.num_decision_vars}, Aux={self.num_aux_vars}, Art={self.num_artificial_vars})"
+            else: # Phase 2 (or direct solve)
+                 title += f" (Dec={self.original_num_decision_vars}, Aux={self.num_aux_vars})"
+            print(f"{title}:\n{self._format_tableau()}\n")
+
 
         while self.iteration < max_iterations:
             pivot_col = self._find_pivot_column()
 
             if pivot_col == -1:
-                if verbose: print("Optimal solution found.")
+                if verbose: print("Optimal solution found for current phase.")
                 return "optimal"
 
             if verbose: print(f"Iteration {self.iteration+1}: Pivot column is {pivot_col} (0-indexed)")
 
             pivot_row = self._find_pivot_row(pivot_col)
 
-            # Check for unboundedness: if a pivot column is identified, but all entries in that
-            # column (for constraint rows) are non-positive (<= 0).
             if pivot_row == -1: # No valid pivot row found
-                all_pivot_col_entries_non_positive = True
+                all_pivot_col_entries_non_positive_for_positive_rhs = True
+                # rhs_col_idx is self.rhs_col_idx
                 for i in range(self.rows - 1): # Check all constraint rows
-                    if self._get_tableau_value(i, pivot_col) > 0:
-                        all_pivot_col_entries_non_positive = False
+                    if self._get_tableau_value(i, self.rhs_col_idx) >= 0 and self._get_tableau_value(i, pivot_col) > 0:
+                        all_pivot_col_entries_non_positive_for_positive_rhs = False
                         break
-                if all_pivot_col_entries_non_positive:
-                    if verbose: print(f"Problem is unbounded. Pivot column {pivot_col} has all non-positive or zero entries in constraint rows.")
+
+                if all_pivot_col_entries_non_positive_for_positive_rhs:
+                    if verbose: print(f"Problem is unbounded. Pivot column {pivot_col} has all non-positive entries in constraint rows with non-negative RHS.")
                     return "unbounded"
                 else:
-                    # This could happen if, for example, all RHS values for potential pivot rows were negative.
-                    # The current _find_pivot_row skips rows with RHS < 0 if pivot_col_val > 0.
-                    if verbose: print(f"Warning: Pivot column {pivot_col} found, but no suitable pivot row. This might indicate issues with problem formulation (e.g. all valid ratios negative or undefined) or all RHS negative.")
+                    if verbose: print(f"Warning: Pivot column {pivot_col} found, but no suitable pivot row.")
                     return "error_no_suitable_pivot_row"
-
 
             if verbose: print(f"Pivot element at ({pivot_row}, {pivot_col}): {self._get_tableau_value(pivot_row, pivot_col)}")
 
@@ -262,145 +568,345 @@ class SimplexSolver:
         if verbose: print("Max iterations reached.")
         return "max_iterations_reached"
 
+    def solve(self, verbose=False, max_iterations=100):
+        """
+        Main solve method for the simplex algorithm. Handles Phase 1 if necessary.
+        """
+        self.iteration = 0 # Reset iteration count for the solve process
+
+        if self.current_phase == 1:
+            if verbose: print("=== Starting Phase 1 ===")
+            phase1_status = self._execute_simplex_iterations(verbose=verbose, max_iterations=max_iterations)
+
+            if phase1_status == "optimal":
+                # Check W value (Phase 1 objective value)
+                # Objective row is self.rows - 1, RHS column is self.rhs_col_idx
+                W_value = self._get_tableau_value(self.rows - 1, self.rhs_col_idx)
+
+                # Using a small tolerance for comparing W_value to zero with Fractions might not be necessary
+                # as Fraction arithmetic is exact. W_value should be exactly 0 if feasible.
+                if W_value < Fraction(0): # Max W = -sum(art_vars). If W_opt < 0 => sum(art_vars) > 0
+                    if verbose: print(f"Phase 1 optimal, but W = {W_value} < 0. Original problem is infeasible.")
+                    return "infeasible"
+                else: # W_value == 0
+                    if verbose: print(f"Phase 1 optimal and W = {W_value}. Proceeding to Phase 2.")
+                    self._prepare_for_phase2(verbose)
+                    # self.current_phase is set to 2 inside _prepare_for_phase2
+                    if verbose: print("=== Starting Phase 2 (after successful Phase 1) ===")
+                    # Iteration count for Phase 2 continues from Phase 1, or could be reset in _prepare_for_phase2 if desired
+                    return self._execute_simplex_iterations(verbose=verbose, max_iterations=max_iterations)
+            else: # Phase 1 not optimal (e.g., unbounded, max_iterations)
+                if verbose: print(f"Phase 1 resulted in status: {phase1_status}. Original problem likely infeasible.")
+                return "infeasible" # Or map phase1_status more directly
+
+        elif self.current_phase == 2: # Directly to Phase 2 (no Phase 1 was needed)
+            if verbose:
+                 print("=== Starting Simplex Method (Direct Solve) ===")
+            # Iteration count for Phase 2 should ideally start from 0 or be managed.
+            # self.iteration was reset at the start of solve().
+            return self._execute_simplex_iterations(verbose=verbose, max_iterations=max_iterations)
+        else:
+            raise RuntimeError(f"Unknown current_phase: {self.current_phase}")
+
+    def _prepare_for_phase2(self, verbose=False):
+        """
+        Prepares the tableau for Phase 2 after a successful Phase 1.
+        This involves removing artificial variables, restoring the original objective function,
+        and ensuring the tableau is in canonical form for the original objective.
+        """
+        if verbose:
+            print("\n--- Preparing for Phase 2 ---")
+            # print("Final Phase 1 Tableau:")
+            # print(self._format_tableau()) # Current tableau is still Phase 1 here
+
+        # Define new column indices (Post-Artificial Variable Removal)
+        phase2_num_decision_vars = self.original_num_decision_vars
+        phase2_num_aux_vars = self.num_aux_vars # Aux vars from Phase 1 (slacks/surplus)
+
+        phase2_P_var_col_idx = phase2_num_decision_vars + phase2_num_aux_vars
+        phase2_rhs_col_idx = phase2_P_var_col_idx + 1
+        phase2_cols = phase2_rhs_col_idx + 1
+        # Number of rows (constraints + 1 objective) remains the same: self.rows
+
+        phase2_tableau = {}
+        obj_row_idx = self.rows - 1 # Objective row index is the last row
+
+        # Copy Constraint Rows (excluding artificial variable columns)
+        for r in range(obj_row_idx): # Iterate through constraint rows
+            # Copy decision variable coefficients
+            for c_dec in range(self.original_num_decision_vars):
+                val = self._get_tableau_value(r, c_dec) # Read from final Phase 1 tableau
+                _set_sparse_val(phase2_tableau, r, c_dec, val)
+
+            # Copy auxiliary variable coefficients
+            # Original aux vars in Phase 1 tableau are at cols: self.original_num_decision_vars to self.original_num_decision_vars + self.num_aux_vars - 1
+            # Their new positions in Phase 2 tableau are the same relative indices.
+            for c_aux_offset in range(self.num_aux_vars):
+                # Column in Phase 1 tableau:
+                p1_aux_col = self.original_num_decision_vars + c_aux_offset
+                # Column in Phase 2 tableau: (same)
+                p2_aux_col = phase2_num_decision_vars + c_aux_offset
+                val = self._get_tableau_value(r, p1_aux_col)
+                _set_sparse_val(phase2_tableau, r, p2_aux_col, val)
+
+            # Copy RHS
+            val = self._get_tableau_value(r, self.rhs_col_idx) # self.rhs_col_idx is from Phase 1
+            _set_sparse_val(phase2_tableau, r, phase2_rhs_col_idx, val)
+
+        # Restore Original Objective Function into phase2_tableau's objective row
+        orig_P_col_in_saved_coeffs = self.original_num_decision_vars + self.num_aux_vars
+        orig_RHS_col_in_saved_coeffs = orig_P_col_in_saved_coeffs + 1
+
+        for col_key, val in self.saved_original_obj_coeffs.items():
+            if col_key < self.original_num_decision_vars: # Decision variable
+                _set_sparse_val(phase2_tableau, obj_row_idx, col_key, val)
+            elif col_key < orig_P_col_in_saved_coeffs: # Auxiliary variable
+                # col_key in saved_coeffs is the original index (dec_vars + aux_offset)
+                # This maps directly to the same column index in phase2_tableau's new structure
+                # because aux vars follow decision vars.
+                _set_sparse_val(phase2_tableau, obj_row_idx, col_key, val)
+            elif col_key == orig_P_col_in_saved_coeffs: # P-variable coefficient
+                _set_sparse_val(phase2_tableau, obj_row_idx, phase2_P_var_col_idx, val)
+            elif col_key == orig_RHS_col_in_saved_coeffs: # RHS value
+                _set_sparse_val(phase2_tableau, obj_row_idx, phase2_rhs_col_idx, val)
+            # else: Malformed saved_original_obj_coeffs key, or not handled.
+
+        # Make Restored Objective Row Canonical
+        # For each column j that is basic in a constraint row r (in phase2_tableau),
+        # the coefficient in the objective row for column j must be zero.
+        _helper_canonicalize_objective_row(
+            phase2_tableau,
+            obj_row_idx,
+            range(phase2_P_var_col_idx), # Check decision and aux variable columns
+            range(phase2_cols),          # Operate on all columns including P and RHS
+            range(obj_row_idx),          # Constraint rows in phase2_tableau
+            verbose=verbose
+        )
+
+        # Update Solver State for Phase 2
+        self.tableau = phase2_tableau
+        # self.num_decision_vars remains self.original_num_decision_vars for Phase 2 logic
+        # self.num_aux_vars remains self.num_aux_vars (from Phase 1)
+        self.num_artificial_vars = 0 # Critical change
+        self.cols = phase2_cols
+        self.objective_var_col_idx = phase2_P_var_col_idx
+        self.rhs_col_idx = phase2_rhs_col_idx
+        # self.rows remains the same
+        self.current_phase = 2 # Officially in Phase 2
+        self.artificial_var_info = [] # Clear this
+
+        if verbose:
+            print("Phase 2 Tableau ready.")
+            # print(self._format_tableau()) # Now self.tableau is phase2_tableau
+
     def get_solution(self):
         """
-        Extracts the variable values and objective function value from the final (optimal) sparse tableau.
-        Returns a dictionary with decision variable values (x1, x2, ...)
-        and the objective function value keyed by 'objective_value'.
+        Extracts variable values and objective function value from the final tableau.
+        Reports original decision variables.
         """
         solution = {}
-        rhs_col_idx = self.cols - 1
+        # rhs_col_idx and obj_row_idx are set based on current phase tableau
         obj_row_idx = self.rows - 1
 
-        # Objective value is in the last row, last column
-        solution['objective_value'] = self._get_tableau_value(obj_row_idx, rhs_col_idx)
+        # Objective value
+        # If current_phase is 1, this is W. If 2, this is P.
+        # The value retrieved is from the current tableau's objective row.
+        active_obj_char = "W" if self.current_phase == 1 else "P"
+        solution[f'{active_obj_char}_objective_value'] = self._get_tableau_value(obj_row_idx, self.rhs_col_idx)
 
-        # Decision variables values
-        # A decision variable x_j (column j) is basic if its column in the final tableau
-        # has a single '1' in a constraint row (say row_basic) and all other entries
-        # in that column (for other constraint rows and the objective row) are '0'.
-        # Its value is then the RHS value of row_basic. Otherwise, it's non-basic and its value is 0.
-        for j in range(self.num_decision_vars): # Iterate through columns of original decision variables
-            val = Fraction(0) # Default to 0 for non-basic variables
+        # Decision variables values (use self.original_num_decision_vars)
+        for j in range(self.original_num_decision_vars):
+            val = Fraction(0)
             basic_row_candidate = -1
             is_basic_column = True
-
-            # Check column j for basic variable characteristics
             count_ones_in_constraints = 0
-
-            for i in range(self.rows - 1): # Iterate through constraint rows
+            for i in range(self.rows - 1): # Constraint rows
                 cell_val = self._get_tableau_value(i, j)
                 if cell_val == Fraction(1):
-                    count_ones_in_constraints += 1
+                    count_ones_in_constraints +=1
                     basic_row_candidate = i
                 elif cell_val != Fraction(0):
-                    is_basic_column = False # Other non-zero in constraint rows
-                    break
+                    is_basic_column = False; break
 
-            if not is_basic_column or count_ones_in_constraints != 1:
-                solution[f'x{j+1}'] = Fraction(0) # Non-basic or complex column
-                continue
-
-            # Check if the objective row coefficient for this column is zero
-            if self._get_tableau_value(obj_row_idx, j) == Fraction(0):
-                # This column j corresponds to a basic variable, its value is on RHS of basic_row_candidate
-                val = self._get_tableau_value(basic_row_candidate, rhs_col_idx)
+            if is_basic_column and count_ones_in_constraints == 1 and \
+               self._get_tableau_value(obj_row_idx, j) == Fraction(0):
+                val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
             else:
-                # Column might look basic in constraints, but if obj func coeff is non-zero, it's non-basic.
-                val = Fraction(0)
-
+                val = Fraction(0) # Non-basic or not uniquely identifiable
             solution[f'x{j+1}'] = val
+
+        # Auxiliary (slack/surplus) variables values
+        # These are in columns from self.original_num_decision_vars to self.original_num_decision_vars + self.num_aux_vars -1
+        if self.num_aux_vars > 0: # If there are any auxiliary variables
+            for j in range(self.num_aux_vars):
+                aux_var_col_idx = self.original_num_decision_vars + j
+                val = Fraction(0)
+                basic_row_candidate = -1
+                is_basic_this_aux_var = True
+                num_ones_in_col = 0
+
+                for i in range(self.rows - 1): # Constraint rows
+                    cell_val = self._get_tableau_value(i, aux_var_col_idx)
+                    if cell_val == Fraction(1): # Basic aux vars should have a 1 after pivots
+                        num_ones_in_col +=1
+                        basic_row_candidate = i
+                    elif cell_val != Fraction(0):
+                        is_basic_this_aux_var = False; break
+
+                if is_basic_this_aux_var and num_ones_in_col == 1 and \
+                   self._get_tableau_value(obj_row_idx, aux_var_col_idx) == Fraction(0):
+                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                else: # Non-basic
+                    val = Fraction(0)
+
+                # self.constraint_types refers to the original problem's constraints
+                var_type_char = 's' if self.constraint_types[j] == 'slack' else 'e'
+                solution[f'{var_type_char}{j+1}'] = val
+
+        # Optionally, report artificial variable values if in Phase 1 and they are basic
+        if self.current_phase == 1 and self.num_artificial_vars > 0:
+            art_var_start_col = self.original_num_decision_vars + self.num_aux_vars
+            for k in range(self.num_artificial_vars):
+                art_var_col_idx = art_var_start_col + k
+                val = Fraction(0)
+                basic_row_candidate = -1
+                is_basic_art_var = True
+                num_ones_in_col = 0
+                for i in range(self.rows -1):
+                    cell_val = self._get_tableau_value(i, art_var_col_idx)
+                    if cell_val == Fraction(1):
+                        num_ones_in_col +=1
+                        basic_row_candidate = i
+                    elif cell_val != Fraction(0):
+                        is_basic_art_var = False; break
+                if is_basic_art_var and num_ones_in_col == 1 and \
+                   self._get_tableau_value(obj_row_idx, art_var_col_idx) == Fraction(0): # Should be 0 for basic art vars in W row
+                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                solution[f'a{k+1}'] = val
 
         return solution
 
 if __name__ == '__main__':
-    # Example 1: Maximize P = 3x1 + 2x2
+    # Example 1: Maximize P = 3x1 + 2x2 (No Phase 1 needed)
     # Subject to: x1 + x2 <= 10, 2x1 + x2 <= 15
+    print("--- Example 1 (Optimal - Direct Solve) ---")
     c1 = [Fraction(3), Fraction(2)]
-    A1 = [
-        [Fraction(1), Fraction(1)],
-        [Fraction(2), Fraction(1)]
-    ]
+    A1 = [[Fraction(1), Fraction(1)], [Fraction(2), Fraction(1)]]
     b1 = [Fraction(10), Fraction(15)]
-
-    # MODIFIED: initialize_tableau now returns 5 values
-    sparse_tab1, n_dec_vars1, n_constraints1, n_rows1, n_cols1 = initialize_tableau(c1, A1, b1)
-    # MODIFIED: SimplexSolver constructor takes new arguments
-    solver1 = SimplexSolver(sparse_tab1, n_dec_vars1, n_constraints1, n_rows1, n_cols1)
-
-    print("--- Example 1 (Optimal) ---")
-    # print("Initial Tableau (Example 1):")
-    # print(solver1._format_tableau()) # Use verbose in solve instead
-
+    solver1 = SimplexSolver(c1, A1, b1)
     status1 = solver1.solve(verbose=True)
     print(f"\nSolver status (Example 1): {status1}")
-
-    print("\nFinal Tableau (Example 1):")
-    print(solver1._format_tableau())
-
     if status1 == 'optimal':
+        print("Final Tableau (Example 1):")
+        print(solver1._format_tableau())
         solution1 = solver1.get_solution()
         print("\nSolution (Example 1):")
         for var, val in solution1.items():
-            print(f"{var}: {val}") # Expected: x1=5, x2=5, obj=25
+            print(f"{var}: {val}")
 
-    # Example 2: Unbounded
+    # Example 2: Unbounded (No Phase 1 needed)
     # Max P = x1 + x2
     # s.t. -x1 + x2 <= 1, x1 - 2x2 <= 2
+    print("\n--- Example 2 (Unbounded - Direct Solve) ---")
     c2 = [Fraction(1), Fraction(1)]
-    A2 = [
-        [Fraction(-1), Fraction(1)],
-        [Fraction(1), Fraction(-2)]
-    ]
+    A2 = [[Fraction(-1), Fraction(1)], [Fraction(1), Fraction(-2)]]
     b2 = [Fraction(1), Fraction(2)]
-
-    sparse_tab2, n_dec_vars2, n_constraints2, n_rows2, n_cols2 = initialize_tableau(c2, A2, b2)
-    solver2 = SimplexSolver(sparse_tab2, n_dec_vars2, n_constraints2, n_rows2, n_cols2)
-
-    print("\n--- Example 2 (Unbounded) ---")
-    # print("Initial Tableau (Example 2):")
-    # print(solver2._format_tableau())
+    solver2 = SimplexSolver(c2, A2, b2)
     status2 = solver2.solve(verbose=True)
     print(f"\nSolver status (Example 2): {status2}")
-    print("\nFinal Tableau (Example 2):") # Will be the tableau state when unboundedness was detected
-    print(solver2._format_tableau())
     if status2 == 'unbounded':
+        print("Final Tableau (Example 2 - Unbounded):")
+        print(solver2._format_tableau())
         print("Problem correctly identified as unbounded.")
-    elif status2 == 'optimal':
-        solution2 = solver2.get_solution()
-        print("\nSolution (Example 2):")
-        for var, val in solution2.items():
-            print(f"{var}: {val}")
 
-    # Example 3: From Wikipedia (Simplex Algorithm page)
-    # Maximize Z = 2x + 3y + 4z
-    # Subject to:
-    # 3x + 2y + z <= 10
-    # 2x + 5y + 3z <= 15
-    # x, y, z >= 0
+    # Example 3: Wikipedia (No Phase 1 needed)
+    print("\n--- Example 3 (Wikipedia - Direct Solve) ---")
     c3 = [Fraction(2), Fraction(3), Fraction(4)]
-    A3 = [
-        [Fraction(3), Fraction(2), Fraction(1)],
-        [Fraction(2), Fraction(5), Fraction(3)]
-    ]
+    A3 = [[Fraction(3), Fraction(2), Fraction(1)], [Fraction(2), Fraction(5), Fraction(3)]]
     b3 = [Fraction(10), Fraction(15)]
-
-    sparse_tab3, n_dec_vars3, n_constraints3, n_rows3, n_cols3 = initialize_tableau(c3, A3, b3)
-    solver3 = SimplexSolver(sparse_tab3, n_dec_vars3, n_constraints3, n_rows3, n_cols3)
-    print("\n--- Example 3 (Wikipedia) ---")
-    status3 = solver3.solve(verbose=True) # Set verbose=True for detailed output
+    solver3 = SimplexSolver(c3, A3, b3)
+    status3 = solver3.solve(verbose=True)
     print(f"\nSolver status (Example 3): {status3}")
-    print("\nFinal Tableau (Example 3):")
-    print(solver3._format_tableau())
     if status3 == 'optimal':
+        print("Final Tableau (Example 3):")
+        print(solver3._format_tableau())
         solution3 = solver3.get_solution()
-        print("\nSolution (Example 3):") # Expected: x1=0, x2=1.25, x3=3.75 -> Z = 20 ? No, x=15/7, y=0, z=25/7, Z=130/7
-                                        # Actual solution from online calculator: x1=1.25, x2=0, x3=3.75 -> P = 17.5 (if coefficients are 2,3,4)
-                                        # My previous example had x1,x2. For x,y,z:
-                                        # Let's recheck example from a source.
-                                        # Using https://online.stat.psu.edu/stat462/node/2 simplex tool
-                                        # For 3x+2y+z<=10, 2x+5y+3z<=15, obj 2x+3y+4z
-                                        # Solution: x=0, y=1.25, z=3.75. Objective value = 18.75 (75/4)
-                                        # My solution: x1: 0, x2: 5/4, x3: 15/4, objective_value: 75/4. This is correct.
+        print("\nSolution (Example 3):")
         for var, val in solution3.items():
             print(f"{var}: {val}")
+
+    # Example 4: Constraint b_i < 0 (Phase 1 needed, should be INFEASIBLE)
+    # Max P = x1 + x2
+    # s.t. x1 + x2 <= -1
+    print("\n--- Example 4 (Infeasible - Phase 1 Triggered) ---")
+    c4 = [Fraction(1), Fraction(1)]
+    A4 = [[Fraction(1), Fraction(1)]]
+    b4 = [Fraction(-1)] # Requires Phase 1 because of negative b
+    solver4 = SimplexSolver(c4, A4, b4)
+    status4 = solver4.solve(verbose=True)
+    print(f"\nSolver status (Example 4): {status4}")
+    if status4 == 'infeasible':
+        print("Problem correctly identified as infeasible by Phase 1.")
+        # Optionally print Phase 1 final tableau
+        print("Final Tableau (Phase 1 - Example 4):")
+        print(solver4._format_tableau())
+        # Solution from get_solution will show W's value
+        solution4 = solver4.get_solution()
+        print("\nSolution data from Phase 1 (Example 4):")
+        for var, val in solution4.items():
+            print(f"{var}: {val}")
+    elif status4 == "phase1_optimal_proceed_to_phase2": # Should not happen for this problem
+        print("Error: Example 4 should be infeasible, not proceed to Phase 2.")
+        print("Final Tableau (Phase 1 - Example 4):")
+        print(solver4._format_tableau())
+
+
+    # Example 5: A problem that is feasible after Phase 1
+    # Max P = 3x1 + 5x2
+    # s.t. x1 <= 4  (x1 + s1 = 4)
+    #      2x2 <= 12 (2x2 + s2 = 12)
+    #      3x1 + 2x2 >= 18 (3x1 + 2x2 - e3 + a1 = 18) -> Phase 1 needed
+    print("\n--- Example 5 (Feasible - Phase 1 to Phase 2) ---")
+    c5 = [Fraction(3), Fraction(5)]
+    A5 = [
+        [Fraction(1), Fraction(0)],
+        [Fraction(0), Fraction(2)],
+        [Fraction(-3), Fraction(-2)] # Changed to model 3x1+2x2 >= 18 correctly
+    ]
+    # To make the third constraint >=, we model it as -Ax <= -b.
+    # So, for 3x1 + 2x2 >= 18, input A_row = [-3, -2] and b = -18.
+    # initialize_tableau will flip it to current_A_row = [3,2], current_b = 18, type='surplus'.
+    # or handle >= directly in initialize_tableau.
+    # Our current initialize_tableau: if b_i < 0 for A_i x <= b_i, it flips.
+    # So, to model 3x1 + 2x2 >= 18, we can write it as -3x1 - 2x2 <= -18.
+    b5 = [Fraction(4), Fraction(12), Fraction(-18)] # Last one will be flipped by initialize_tableau
+                                                 # -3x1 -2x2 <= -18  => 3x1+2x2 >= 18 => 3x1+2x2-e3=18
+                                                 # constraint_types should be ['slack', 'slack', 'surplus']
+    solver5 = SimplexSolver(c5, A5, b5)
+    status5 = solver5.solve(verbose=True)
+    print(f"\nSolver status (Example 5): {status5}")
+
+    if status5 == 'optimal': # This will be from Phase 2 if fully implemented
+        print("Final Tableau (Phase 2 - Example 5):")
+        print(solver5._format_tableau())
+        solution5 = solver5.get_solution()
+        print("\nSolution (Example 5):")
+        for var, val in solution5.items():
+            print(f"{var}: {val}")
+    elif status5 == "phase1_optimal_proceed_to_phase2":
+        print("Phase 1 was optimal, ready for Phase 2.")
+        print("Current (end of Phase 1) Tableau (Example 5):")
+        # When printing the tableau at the end of successful phase 1,
+        # self.current_phase might have already been set to 2 by the solve() method
+        # if we were to fully implement _prepare_for_phase2.
+        # For now, solve() returns "phase1_optimal_proceed_to_phase2" and current_phase is still 1.
+        print(solver5._format_tableau()) # This should use 'W' due to current_phase=1
+        solution5_phase1 = solver5.get_solution() # This should also report W_objective_value
+        print("\nSolution data from end of Phase 1 (Example 5):")
+        for var, val in solution5_phase1.items():
+            print(f"{var}: {val}")
+    elif status5 == 'infeasible':
+         print("Problem (Example 5) found infeasible.")
+
+    # Remove direct tests of construct_phase1_tableau as it's internal now
+    # (The test code for construct_phase1_tableau from previous step is implicitly removed by this overwrite)
