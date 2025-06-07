@@ -25,11 +25,13 @@ The simplex algorithm, developed by George Dantzig, is a widely used algorithm f
 This implementation focuses on the standard simplex method for problems in the form:
 Maximize: \( P = c^T x \)
 Subject to: \( Ax \leq b \) and \( x \geq 0 \)
+It can also handle problems requiring artificial variables for an initial feasible solution by using the two-phase simplex method.
 
 ## Features
 - Solves linear programming problems (maximization).
 - Uses `fractions.Fraction` for exact arithmetic, avoiding floating-point errors.
 - Detects optimal solutions and unbounded problems.
+- Handles problems requiring the two-phase simplex method (e.g., those with '>=' constraints).
 - Provides a clear way to input LP problems and retrieve solutions.
 - Includes unit tests for reliability.
 
@@ -136,8 +138,7 @@ python -m unittest tests.test_simplex
 ```
 
 ## Limitations
-- **Standard Form Only**: Currently handles maximization problems in the standard form (Ax <= b, x >= 0).
-- **No Two-Phase Simplex**: Does not implement the two-phase simplex method, so it cannot directly handle problems with equality constraints or constraints requiring artificial variables for an initial feasible solution. It assumes an initial basic feasible solution is formed by adding slack variables.
+- **Standard Form Focus**: While the two-phase simplex method allows handling various constraint types, the core implementation is primarily built around the standard form (Ax <= b, x >= 0) for maximization.
 - **No Anti-Cycling Rules**: Does not implement anti-cycling rules (e.g., Bland's rule). While cycling is rare in practice, it's a theoretical possibility for degenerate problems.
 - **Minimization**: To solve minimization problems (minimize Z = c'x), convert it to a maximization problem (maximize P = -Z = -c'x).
 
