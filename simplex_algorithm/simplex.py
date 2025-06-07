@@ -461,56 +461,83 @@ class SimplexSolver:
                             self._set_tableau_value(i, j, new_val)
 
     def _format_tableau(self):
-        """Formats the sparse tableau for printing by reconstructing a dense view."""
         s = []
         dense_tableau_for_print = []
         for i in range(self.rows):
             row_list = []
             for j in range(self.cols):
-                row_list.append(self._get_tableau_value(i,j))
+                row_list.append(self._get_tableau_value(i,j)) # Use self._get_tableau_value
             dense_tableau_for_print.append(row_list)
 
         col_widths = [0] * self.cols
+        # Step 1: Calculate initial widths based on cell values (data)
         for r_list in dense_tableau_for_print:
             for idx, cell_val in enumerate(r_list):
                 col_widths[idx] = max(col_widths[idx], len(str(cell_val)))
 
-        header = []
-        # Decision variables (always use self.original_num_decision_vars for x_i labels)
+        # Step 2: Generate final raw header strings
+        raw_header_labels = [""] * self.cols # Initialize with placeholders matching number of columns
+
+        # Populate raw_header_labels based on column type
+        # Decision variables
+        # self.num_decision_vars in Phase 1 might include artificial vars if not careful.
+        # self.original_num_decision_vars is the true count of x_i variables.
         for j in range(self.original_num_decision_vars):
-             header.append(f"x{j+1}".ljust(col_widths[j]))
+            if j < self.cols: raw_header_labels[j] = f"x{j+1}"
 
-        current_col_offset = self.original_num_decision_vars
-
+        current_col_idx = self.original_num_decision_vars
         # Auxiliary variables
-        for j in range(self.num_aux_vars):
-            var_type_char = 's' if self.constraint_types[j] == 'slack' else 'e'
-            header.append(f"{var_type_char}{j+1}".ljust(col_widths[current_col_offset + j]))
-        current_col_offset += self.num_aux_vars
+        # self.num_aux_vars is the count of slack/surplus variables.
+        # self.constraint_types length should match self.num_aux_vars (from original problem setup)
+        for aux_var_num in range(self.num_aux_vars):
+            if current_col_idx < self.cols:
+                # Ensure constraint_types has this index, can happen if num_aux_vars changes unexpectedly
+                # However, self.constraint_types should be static based on original problem.
+                var_type_char = 's' if aux_var_num < len(self.constraint_types) and self.constraint_types[aux_var_num] == 'slack' else 'e'
+                raw_header_labels[current_col_idx] = f"{var_type_char}{aux_var_num+1}"
+            current_col_idx += 1
 
-        # Artificial variables (if any)
-        if self.current_phase == 1 or self.num_artificial_vars > 0 : # Check num_artificial_vars for safety
-            for j in range(self.num_artificial_vars):
-                 header.append(f"a{j+1}".ljust(col_widths[current_col_offset + j]))
-        # current_col_offset += self.num_artificial_vars # Not needed if objective_var_col_idx is used directly
+        # Artificial variables (if they are part of the current tableau structure)
+        # self.num_artificial_vars is set in __init__ based on current phase
+        if self.num_artificial_vars > 0:
+            for art_var_num in range(self.num_artificial_vars):
+                if current_col_idx < self.cols:
+                     raw_header_labels[current_col_idx] = f"a{art_var_num+1}"
+                current_col_idx += 1
 
-        # Objective variable (P or W)
-        # Use self.current_phase to determine W or P for the currently active tableau
-        active_obj_var_char = "W" if self.current_phase == 1 else "P"
-        header.append(active_obj_var_char.ljust(col_widths[self.objective_var_col_idx]))
+        # Objective variable (P or W) - its column index is self.objective_var_col_idx
+        if self.objective_var_col_idx < self.cols:
+            active_obj_var_char = "W" if self.current_phase == 1 else "P"
+            raw_header_labels[self.objective_var_col_idx] = active_obj_var_char
 
-        # RHS
-        header.append("RHS".ljust(col_widths[self.rhs_col_idx]))
+        # RHS - its column index is self.rhs_col_idx
+        if self.rhs_col_idx < self.cols:
+            raw_header_labels[self.rhs_col_idx] = "RHS"
 
-        s.append(" | ".join(header))
-        s.append("-+-".join(["-" * w for w in col_widths]))
+        # Step 3: Update col_widths using the lengths of raw_header_labels
+        for j in range(self.cols):
+            col_widths[j] = max(col_widths[j], len(raw_header_labels[j]))
 
-        for i in range(self.rows):
+        # Previous DEBUG print lines for col_widths are now removed.
+
+        # Step 4: Construct the actual display header string using ljust and final col_widths
+        header_display_parts = []
+        for j in range(self.cols):
+            header_display_parts.append(raw_header_labels[j].ljust(col_widths[j]))
+
+        s.append(" | ".join(header_display_parts))
+
+        # Step 5: Separator line
+        s.append("-+-".join(["-" * col_widths[j] for j in range(self.cols)]))
+
+        # Step 6: Data rows
+        for i in range(self.rows): # Iterate all rows including objective
             row_str_list = []
-            for j in range(self.cols):
-                val = self._get_tableau_value(i,j)
+            for j in range(self.cols): # Iterate all actual columns in the tableau data
+                val = self._get_tableau_value(i,j) # Use self._get_tableau_value
                 row_str_list.append(str(val).ljust(col_widths[j]))
             s.append(" | ".join(row_str_list))
+
         return "\n".join(s)
 
     def _execute_simplex_iterations(self, verbose=False, max_iterations=100):
