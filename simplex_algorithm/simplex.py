@@ -85,6 +85,100 @@ def initialize_tableau(c, A_orig, b_orig):
 
     return sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols, constraint_types
 
+
+def initialize_tableau_sparse(c_sparse, A_sparse, b_list):
+    """
+    Initializes the simplex tableau from sparse input formats.
+    Maximize P = c'x
+    Subject to Ax <= b (or Ax >= b if b_i was negative)
+    This function ensures all RHS values (b) are non-negative in the tableau.
+
+    Args:
+        c_sparse: Dictionary of coefficients for the objective function
+                  (keyed by integer variable number, 0-indexed).
+        A_sparse: List of dictionaries for the constraint matrix. Each dictionary
+                  represents a row, keyed by integer variable number (0-indexed).
+        b_list: List of RHS values (fractions.Fraction) for constraints.
+
+    Returns:
+        sparse_tableau: Dictionary {(row, col): Fraction_value}.
+        num_decision_vars: Number of original decision variables.
+        num_aux_vars: Number of auxiliary (slack/surplus) variables (matches num_constraints).
+        num_tableau_rows: Total rows in the tableau.
+        num_tableau_cols: Total columns in the tableau.
+        constraint_types: List of strings ('slack' or 'surplus') for each constraint.
+    """
+    max_var_idx = -1
+    if c_sparse:
+        max_var_idx = max(max_var_idx, max(c_sparse.keys()))
+    for A_row_dict in A_sparse:
+        if A_row_dict:
+            max_var_idx = max(max_var_idx, max(A_row_dict.keys()))
+
+    num_decision_vars = max_var_idx + 1 if max_var_idx > -1 else 0
+
+    num_constraints = len(b_list) # This is also num_aux_vars (number of slack/surplus variables)
+
+    if len(A_sparse) != num_constraints:
+        raise ValueError("Number of constraint rows in A_sparse must match number of RHS values in b_list.")
+
+    constraint_types = []
+
+    num_tableau_rows = num_constraints + 1
+    # Columns: decision_vars + aux_vars (slack/surplus) + P_var + RHS_value
+    num_tableau_cols = num_decision_vars + num_constraints + 1 + 1
+
+    sparse_tableau = {}
+
+    # Constraint rows
+    for i in range(num_constraints):
+        current_A_row_dict = A_sparse[i]
+        current_b_val = b_list[i]
+        aux_var_coeff = Fraction(1) # Default for slack
+
+        if current_b_val < 0:
+            # Multiply constraint by -1: -A_i x >= -b_i (becomes positive)
+            # Add surplus variable e_i: -A_i x - e_i = -b_i
+            # So, coefficients in current_A_row_dict are negated.
+            current_b_val = -current_b_val # b_i becomes positive
+            constraint_types.append('surplus')
+            aux_var_coeff = Fraction(-1) # Surplus variable has -1 coeff in its equation
+
+            # Effective coefficients for the tableau row are negated from original A_sparse[i]
+            for col_idx, coeff in current_A_row_dict.items():
+                if coeff != 0:
+                    sparse_tableau[(i, col_idx)] = Fraction(-coeff)
+        else:
+            # Original A_i x <= b_i
+            # Add slack variable s_i: A_i x + s_i = b_i
+            constraint_types.append('slack')
+            # aux_var_coeff is already Fraction(1)
+            for col_idx, coeff in current_A_row_dict.items():
+                if coeff != 0:
+                    sparse_tableau[(i, col_idx)] = Fraction(coeff)
+
+        # Auxiliary (slack or surplus) variable coefficient
+        # For constraint row i, aux_var_i has its specific coefficient
+        sparse_tableau[(i, num_decision_vars + i)] = aux_var_coeff
+
+        # RHS
+        if current_b_val != 0: # Should always be non-negative now
+            sparse_tableau[(i, num_tableau_cols - 1)] = Fraction(current_b_val)
+
+    # Objective function row (last row)
+    obj_row_idx = num_constraints
+    # Decision variable coefficients (negated)
+    for col_idx, coeff in c_sparse.items():
+        if coeff != 0: # Only store non-zero values
+            sparse_tableau[(obj_row_idx, col_idx)] = Fraction(-coeff)
+
+    # Auxiliary variable coefficients in objective function are 0, so don't store
+    # Coefficient for P is 1
+    sparse_tableau[(obj_row_idx, num_decision_vars + num_constraints)] = Fraction(1)
+    # RHS for objective function is 0, so don't store
+
+    return sparse_tableau, num_decision_vars, num_constraints, num_tableau_rows, num_tableau_cols, constraint_types
+
 # Helper function to set values in sparse tableau dictionary
 def _set_sparse_val(target_dict, r, c, val):
     if val == Fraction(0):
@@ -321,16 +415,22 @@ def construct_phase1_tableau(initial_tableau_data):
 
 
 class SimplexSolver:
-    def __init__(self, c_orig, A_orig, b_orig):
+    def __init__(self, c_orig, A_orig, b_orig, sparse_input=False):
         """
         Initializes the SimplexSolver with the problem definition.
         It sets up for Phase 1 if needed, otherwise prepares for direct solution.
         Args:
-            c_orig: List of coefficients for the objective function.
-            A_orig: List of lists representing the constraint matrix.
+            c_orig: Coefficients for the objective function.
+                    List if sparse_input=False, Dict if sparse_input=True.
+            A_orig: Constraint matrix.
+                    List of lists if sparse_input=False, List of Dicts if sparse_input=True.
             b_orig: List of RHS values for constraints.
+            sparse_input: Boolean, True if c_orig and A_orig are in sparse format.
         """
-        initial_tableau_data = initialize_tableau(c_orig, A_orig, b_orig)
+        if sparse_input:
+            initial_tableau_data = initialize_tableau_sparse(c_orig, A_orig, b_orig)
+        else:
+            initial_tableau_data = initialize_tableau(c_orig, A_orig, b_orig)
         # sparse_tableau_in, num_decision_vars, num_aux_vars, num_rows_in, num_cols_in, constraint_types_in
 
         self.original_num_decision_vars = initial_tableau_data[1]
@@ -741,6 +841,8 @@ class SimplexSolver:
         active_obj_char = "W" if self.current_phase == 1 else "P"
         solution[f'{active_obj_char}_objective_value'] = self._get_tableau_value(obj_row_idx, self.rhs_col_idx)
 
+        row_has_sourced_basic_var = [False] * (self.rows - 1)
+
         # Decision variables values (use self.original_num_decision_vars)
         for j in range(self.original_num_decision_vars):
             val = Fraction(0)
@@ -753,20 +855,23 @@ class SimplexSolver:
                     count_ones_in_constraints +=1
                     basic_row_candidate = i
                 elif cell_val != Fraction(0):
-                    is_basic_column = False; break
+                    is_basic_column = False
+                    break
 
             if is_basic_column and count_ones_in_constraints == 1 and \
                self._get_tableau_value(obj_row_idx, j) == Fraction(0):
-                val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
-            else:
-                val = Fraction(0) # Non-basic or not uniquely identifiable
+                if not row_has_sourced_basic_var[basic_row_candidate]:
+                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                    row_has_sourced_basic_var[basic_row_candidate] = True
+                # else: val remains Fraction(0) as row already sourced a basic var
+            # else: val remains Fraction(0) as variable j is not basic
             solution[f'x{j+1}'] = val
 
         # Auxiliary (slack/surplus) variables values
         # These are in columns from self.original_num_decision_vars to self.original_num_decision_vars + self.num_aux_vars -1
         if self.num_aux_vars > 0: # If there are any auxiliary variables
-            for j in range(self.num_aux_vars):
-                aux_var_col_idx = self.original_num_decision_vars + j
+            for j_aux_offset in range(self.num_aux_vars):
+                aux_var_col_idx = self.original_num_decision_vars + j_aux_offset
                 val = Fraction(0)
                 basic_row_candidate = -1
                 is_basic_this_aux_var = True
@@ -778,19 +883,26 @@ class SimplexSolver:
                         num_ones_in_col +=1
                         basic_row_candidate = i
                     elif cell_val != Fraction(0):
-                        is_basic_this_aux_var = False; break
+                        is_basic_this_aux_var = False
+                        break
 
                 if is_basic_this_aux_var and num_ones_in_col == 1 and \
                    self._get_tableau_value(obj_row_idx, aux_var_col_idx) == Fraction(0):
-                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
-                else: # Non-basic
-                    val = Fraction(0)
+                    if not row_has_sourced_basic_var[basic_row_candidate]:
+                        val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                        row_has_sourced_basic_var[basic_row_candidate] = True
+                    # else: val remains Fraction(0)
+                # else: val remains Fraction(0)
 
                 # self.constraint_types refers to the original problem's constraints
-                var_type_char = 's' if self.constraint_types[j] == 'slack' else 'e'
-                solution[f'{var_type_char}{j+1}'] = val
+                var_type_char = 's' if self.constraint_types[j_aux_offset] == 'slack' else 'e'
+                solution[f'{var_type_char}{j_aux_offset+1}'] = val
 
         # Optionally, report artificial variable values if in Phase 1 and they are basic
+        # This part should also ideally use row_has_sourced_basic_var if artificial vars can be basic in phase 1 final tableau
+        # For now, assuming Phase 1 ensures artificial vars are non-basic if W=0, or problem is infeasible.
+        # If an artificial var *is* still basic and W=0 (degenerate case), the current logic might misreport.
+        # However, the primary goal of Phase 1 is to drive them to 0.
         if self.current_phase == 1 and self.num_artificial_vars > 0:
             art_var_start_col = self.original_num_decision_vars + self.num_aux_vars
             for k in range(self.num_artificial_vars):
