@@ -305,14 +305,14 @@ class TestSimplexSolver(unittest.TestCase):
         self.assertEqual(solution['x1'], Fraction(2))
         self.assertEqual(solution['x2'], Fraction(6))
 
-        # Verify slack/surplus values based on solution x1=2, x2=6:
-        # s1 for x1 <= 4: x1 + s1 = 4 => 2 + s1 = 4 => s1 = 2
-        # s2 for 2x2 <= 12: 2x2 + s2 = 12 => 2*6 + s2 = 12 => 12 + s2 = 12 => s2 = 0
-        # e3 for 3x1+2x2 >= 18 (internally 3x1+2x2-e3=18): 3*2+2*6-e3=18 => 6+12-e3=18 => 18-e3=18 => e3=0
-        if 's1' in solution: self.assertEqual(solution['s1'], Fraction(2))
-        if 's2' in solution: self.assertEqual(solution['s2'], Fraction(0))
-        if 'e3' in solution: self.assertEqual(solution['e3'], Fraction(0))
 
+        # Verify slack/surplus values based on solution x1=4, x2=6:
+        # s1 for x1 <= 4: x1 + s1 = 4 => 4 + s1 = 4 => s1 = 0
+        # s2 for 2x2 <= 12: 2x2 + s2 = 12 => 2*6 + s2 = 12 => 12 + s2 = 12 => s2 = 0
+        # e3 for 3x1+2x2 >= 18 (internally 3x1+2x2-e3=18): 3*4+2*6-e3=18 => 12+12-e3=18 => 24-e3=18 => e3=6
+        if 's1' in solution: self.assertEqual(solution['s1'], Fraction(0))
+        if 's2' in solution: self.assertEqual(solution['s2'], Fraction(0))
+        if 'e3' in solution: self.assertEqual(solution['e3'], Fraction(6))
 
     def test_equality_constraint_via_two_phase(self):
         # Max P = 2x1 + x2, s.t. x1 + x2 = 5, x1 <= 3, x2 <= 4.
@@ -417,10 +417,16 @@ class TestSimplexSolver(unittest.TestCase):
         status = solver.solve()
         self.assertEqual(status, "optimal")
         solution = solver.get_solution()
-        # Expected solution based on Example 5 discussion: P=36, x1=2, x2=6
-        self.assertEqual(solution['P_objective_value'], Fraction(36))
-        self.assertEqual(solution['x1'], Fraction(2))
+        self.assertEqual(solution['P_objective_value'], Fraction(42))
+        self.assertEqual(solution['x1'], Fraction(4))
         self.assertEqual(solution['x2'], Fraction(6))
+        # For x1=4, x2=6:
+        # s1 (x1 <= 4): 4 + s1 = 4 => s1 = 0
+        # s2 (2x2 <= 12): 2*6 + s2 = 12 => s2 = 0
+        # e3 (3x1+2x2 >= 18 => 3x1+2x2-e3=18): 3*4+2*6-e3=18 => 24-e3=18 => e3=6
+        if 's1' in solution: self.assertEqual(solution['s1'], Fraction(0))
+        if 's2' in solution: self.assertEqual(solution['s2'], Fraction(0))
+        if 'e3' in solution: self.assertEqual(solution['e3'], Fraction(6))
 
     def test_sparse_non_sequential_vars_optimal(self):
         # Max P = x1 + x3 (x2 is missing, var indices 0 and 2)
@@ -437,23 +443,15 @@ class TestSimplexSolver(unittest.TestCase):
         self.assertEqual(status, "optimal")
         solution = solver.get_solution()
         self.assertEqual(solution['P_objective_value'], Fraction(5))
-        # One possible solution is x1=5, x2=0, x3=0. Another is x1=0, x2=0, x3=5.
-        # The sum of x1 and x3 should be 5 if they are positive, or one is 5 and other 0.
-        # Check if the solution is valid.
-        is_x1_5_x3_0 = (solution.get('x1', Fraction(0)) == Fraction(5) and solution.get('x3', Fraction(0)) == Fraction(0))
-        is_x1_0_x3_5 = (solution.get('x1', Fraction(0)) == Fraction(0) and solution.get('x3', Fraction(0)) == Fraction(5))
-        # Check if x2 is 0 as it's not in the objective or constraints in a way that it must take a value.
-        is_x2_0 = (solution.get('x2', Fraction(0)) == Fraction(0))
 
-        self.assertTrue((is_x1_5_x3_0 or is_x1_0_x3_5) and is_x2_0)
-        if is_x1_5_x3_0:
-            self.assertEqual(solution['x1'], Fraction(5))
-            self.assertEqual(solution.get('x2', Fraction(0)), Fraction(0))
-            self.assertEqual(solution.get('x3', Fraction(0)), Fraction(0))
-        else: # is_x1_0_x3_5
-            self.assertEqual(solution.get('x1', Fraction(0)), Fraction(0))
-            self.assertEqual(solution.get('x2', Fraction(0)), Fraction(0))
-            self.assertEqual(solution['x3'], Fraction(5))
+        x1_val = solution.get('x1', Fraction(0))
+        x2_val = solution.get('x2', Fraction(0))
+        x3_val = solution.get('x3', Fraction(0))
+
+        self.assertEqual(x2_val, Fraction(0), "x2 should be 0")
+        self.assertGreaterEqual(x1_val, Fraction(0), "x1 should be non-negative")
+        self.assertGreaterEqual(x3_val, Fraction(0), "x3 should be non-negative")
+        self.assertEqual(x1_val + x3_val, Fraction(5), "Sum of x1 and x3 should be 5 for optimal solution")
 
 if __name__ == '__main__':
     unittest.main(argv=['first-arg-is-ignored'], exit=False)

@@ -841,6 +841,8 @@ class SimplexSolver:
         active_obj_char = "W" if self.current_phase == 1 else "P"
         solution[f'{active_obj_char}_objective_value'] = self._get_tableau_value(obj_row_idx, self.rhs_col_idx)
 
+        row_has_sourced_basic_var = [False] * (self.rows - 1)
+
         # Decision variables values (use self.original_num_decision_vars)
         for j in range(self.original_num_decision_vars):
             val = Fraction(0)
@@ -853,20 +855,23 @@ class SimplexSolver:
                     count_ones_in_constraints +=1
                     basic_row_candidate = i
                 elif cell_val != Fraction(0):
-                    is_basic_column = False; break
+                    is_basic_column = False
+                    break
 
             if is_basic_column and count_ones_in_constraints == 1 and \
                self._get_tableau_value(obj_row_idx, j) == Fraction(0):
-                val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
-            else:
-                val = Fraction(0) # Non-basic or not uniquely identifiable
+                if not row_has_sourced_basic_var[basic_row_candidate]:
+                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                    row_has_sourced_basic_var[basic_row_candidate] = True
+                # else: val remains Fraction(0) as row already sourced a basic var
+            # else: val remains Fraction(0) as variable j is not basic
             solution[f'x{j+1}'] = val
 
         # Auxiliary (slack/surplus) variables values
         # These are in columns from self.original_num_decision_vars to self.original_num_decision_vars + self.num_aux_vars -1
         if self.num_aux_vars > 0: # If there are any auxiliary variables
-            for j in range(self.num_aux_vars):
-                aux_var_col_idx = self.original_num_decision_vars + j
+            for j_aux_offset in range(self.num_aux_vars):
+                aux_var_col_idx = self.original_num_decision_vars + j_aux_offset
                 val = Fraction(0)
                 basic_row_candidate = -1
                 is_basic_this_aux_var = True
@@ -878,19 +883,26 @@ class SimplexSolver:
                         num_ones_in_col +=1
                         basic_row_candidate = i
                     elif cell_val != Fraction(0):
-                        is_basic_this_aux_var = False; break
+                        is_basic_this_aux_var = False
+                        break
 
                 if is_basic_this_aux_var and num_ones_in_col == 1 and \
                    self._get_tableau_value(obj_row_idx, aux_var_col_idx) == Fraction(0):
-                    val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
-                else: # Non-basic
-                    val = Fraction(0)
+                    if not row_has_sourced_basic_var[basic_row_candidate]:
+                        val = self._get_tableau_value(basic_row_candidate, self.rhs_col_idx)
+                        row_has_sourced_basic_var[basic_row_candidate] = True
+                    # else: val remains Fraction(0)
+                # else: val remains Fraction(0)
 
                 # self.constraint_types refers to the original problem's constraints
-                var_type_char = 's' if self.constraint_types[j] == 'slack' else 'e'
-                solution[f'{var_type_char}{j+1}'] = val
+                var_type_char = 's' if self.constraint_types[j_aux_offset] == 'slack' else 'e'
+                solution[f'{var_type_char}{j_aux_offset+1}'] = val
 
         # Optionally, report artificial variable values if in Phase 1 and they are basic
+        # This part should also ideally use row_has_sourced_basic_var if artificial vars can be basic in phase 1 final tableau
+        # For now, assuming Phase 1 ensures artificial vars are non-basic if W=0, or problem is infeasible.
+        # If an artificial var *is* still basic and W=0 (degenerate case), the current logic might misreport.
+        # However, the primary goal of Phase 1 is to drive them to 0.
         if self.current_phase == 1 and self.num_artificial_vars > 0:
             art_var_start_col = self.original_num_decision_vars + self.num_aux_vars
             for k in range(self.num_artificial_vars):
