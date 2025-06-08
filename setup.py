@@ -6,20 +6,20 @@ def read(fname):
     return open(os.path.join(os.path.dirname(__file__), fname)).read()
 
 setup(
-    name='exact_simplex_solver', # Changed name slightly for more clarity
+    name='exact_simplex',
     version='0.1.1', # Incremented version slightly
     author='Jules Agent', # Placeholder
-    author_email='agent@example.com', # Placeholder
+    author_email='josh.t.burdick@gmail.com',
     description='An exact simplex algorithm implementation using Python Fractions.',
     long_description=read('README.md'),
     long_description_content_type='text/markdown',
-    url='http://example.com/p/exact_simplex_solver', # Placeholder URL
+    url='http://example.com/p/exact_simplex', # Placeholder URL
     packages=find_packages(exclude=['tests*']), # Exclude tests directory
     install_requires=[
         # No external dependencies, as it uses standard library 'fractions'
     ],
     classifiers=[
-        'Development Status :: 4 - Beta', # Or 3 - Alpha if preferred
+        'Development Status :: 2 - Pre-Alpha',
         'Intended Audience :: Developers',
         'Intended Audience :: Education',
         'Intended Audience :: Science/Research',
